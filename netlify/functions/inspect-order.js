@@ -95,14 +95,14 @@ exports.handler = async function (event) {
           country: record.shipping?.address?.country
         },
         items: (record.manifest?.items || []).map(
-          item => ({
-            imageId: item.imageId,
-            printSize: item.printSize,
-            quantity: item.quantity,
-            finish: item.finish,
-            hasImageUrl: !!item.imageUrl
-          })
-        ),
+  item => ({
+    imageId: item.id,
+    printSize: item.size,
+    quantity: item.qty,
+    finish: item.finish,
+    hasImageUrl: !!item.url
+  })
+),
         fulfillment: record.fulfillment
       }, null, 2)
     };
