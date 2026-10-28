@@ -36,13 +36,15 @@ exports.handler = async function () {
     const payload = {
       shippingMethod: "Budget",
       destinationCountryCode: "US",
-      currencyCode: "USD",
-      items: scenario.quantities.map(([sku, copies]) => ({
-        sku,
-        copies,
-        attributes: {},
-        assets: [{ printArea: "default" }]
-      }))
+      currencyCode: "USD",      
+items: scenario.quantities.map(([sku, copies]) => ({
+  sku,
+  copies,
+  attributes: {
+    finish: "gloss"
+  },
+  assets: [{ printArea: "default" }]
+}))
     };
 
     try {
