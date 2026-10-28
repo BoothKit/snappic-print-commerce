@@ -49,7 +49,7 @@ exports.handler = async function (event) {
       email: "test@example.com",
       address: {
         line1: "3175 Corporate Center Parkway",
-        line2: "",
+        line2: "Apt 131",
         postalOrZipCode: "34744",
         countryCode: "US",
         townOrCity: "Kissimmee",
