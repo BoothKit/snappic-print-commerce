@@ -6,19 +6,25 @@
   window.__pcInitialized = true;
 
   const PC = {
-    version: "0.3.0",
+    version: "0.4.0",
+
+    apiBase:
+      "https://snappic-print-commerce.netlify.app",
+
     prices: {
       "2x6": 4.99,
-      "4x6": 5.99,
-      "5x7": 7.99
+      "4x6": 4.99,
+      "5x7": 6.99
     },
+
     maxQuantity: 50
   };
 
   const state = {
     images: [],
     selection: "main",
-    quantity: 1
+    quantity: 1,
+    checkoutPending: false
   };
 
   const $ = (selector, root = document) =>
@@ -29,8 +35,9 @@
   function getFormat(width, height) {
     if (!width || !height) return null;
 
-    const ratio = Math.max(width, height) /
-                  Math.min(width, height);
+    const ratio =
+      Math.max(width, height) /
+      Math.min(width, height);
 
     const formats = [
       { name: "2x6", ratio: 3 },
@@ -51,7 +58,9 @@
     const main = $("#guest_main_url");
     const original = $("#guest_second_url");
 
-    const mainURL = main?.currentSrc || main?.src || "";
+    const mainURL =
+      main?.currentSrc || main?.src || "";
+
     const originalURL =
       original?.currentSrc || original?.src || "";
 
@@ -67,7 +76,9 @@
 
     const images = [{
       id: "main",
-      label: originalAvailable ? "AI Photo" : "Your Photo",
+      label: originalAvailable
+        ? "AI Photo"
+        : "Your Photo",
       url: mainURL,
       element: main
     }];
@@ -88,19 +99,20 @@
     return new Promise(resolve => {
       const element = item.element;
 
-      // Prefer Snappic's already-loaded image dimensions.
-      if (element?.naturalWidth && element?.naturalHeight) {
-        const format = getFormat(
-          element.naturalWidth,
-          element.naturalHeight
-        );
-
+      if (
+        element?.naturalWidth &&
+        element?.naturalHeight
+      ) {
         resolve({
           id: item.id,
           label: item.label,
           url: item.url,
-          format
+          format: getFormat(
+            element.naturalWidth,
+            element.naturalHeight
+          )
         });
+
         return;
       }
 
@@ -125,17 +137,20 @@
 
   async function prepareImages() {
     const media = getMedia();
+
     if (!media) return [];
 
     const results = await Promise.all(
       media.map(inspectImage)
     );
 
-    console.table(results.map(item => ({
-      image: item?.label,
-      format: item?.format,
-      url: item?.url
-    })));
+    console.table(
+      results.map(item => ({
+        image: item?.label,
+        format: item?.format,
+        url: item?.url
+      }))
+    );
 
     return results.filter(item => item?.format);
   }
@@ -154,13 +169,17 @@
     const images = selectedImages();
     const preview = $("#pc-preview-area");
 
+    if (!preview) return;
+
     preview.replaceChildren();
 
     images.forEach(image => {
       const img = document.createElement("img");
+
       img.src = image.url;
       img.alt = image.label;
       img.className = "pc-preview-image";
+
       preview.appendChild(img);
     });
 
@@ -169,22 +188,41 @@
 
     if (state.images.length > 1) {
       const options = [
-        { id: "main", label: "AI Photo" },
-        { id: "original", label: "Original Photo" },
-        { id: "both", label: "Both Photos" }
+        {
+          id: "main",
+          label: "AI Photo"
+        },
+        {
+          id: "original",
+          label: "Original Photo"
+        },
+        {
+          id: "both",
+          label: "Both Photos"
+        }
       ];
 
       options.forEach(option => {
-        const button = document.createElement("button");
+        const button =
+          document.createElement("button");
+
         button.type = "button";
-        button.className = "pc-choice" +
-          (state.selection === option.id
-            ? " pc-selected"
-            : "");
+
+        button.className =
+          "pc-choice" +
+          (
+            state.selection === option.id
+              ? " pc-selected"
+              : ""
+          );
 
         button.textContent = option.label;
 
+        button.disabled = state.checkoutPending;
+
         button.addEventListener("click", () => {
+          if (state.checkoutPending) return;
+
           state.selection = option.id;
           updateModal();
         });
@@ -193,31 +231,47 @@
       });
     }
 
-    const formatNames = [...new Set(
-      images.map(image => image.format)
-    )];
+    const formatNames = [
+      ...new Set(
+        images.map(image => image.format)
+      )
+    ];
 
     $("#pc-format").textContent =
-      formatNames.map(format =>
-        format.replace("x", "×")
-      ).join(" + ") + " Print";
+      formatNames
+        .map(format => format.replace("x", "×"))
+        .join(" + ") + " Print";
 
     const unitTotal = images.reduce(
-      (sum, image) => sum + PC.prices[image.format],
+      (sum, image) =>
+        sum + (PC.prices[image.format] || 0),
       0
     );
 
     $("#pc-unit-price").textContent =
       money(unitTotal);
 
-    $("#pc-quantity").textContent = state.quantity;
+    $("#pc-quantity").textContent =
+      state.quantity;
 
     $("#pc-subtotal").textContent =
       money(unitTotal * state.quantity);
 
+    const totalPrints =
+      images.length * state.quantity;
+
     $("#pc-print-count").textContent =
-      (images.length * state.quantity) + " total print" +
-      (images.length * state.quantity === 1 ? "" : "s");
+      totalPrints +
+      " total print" +
+      (totalPrints === 1 ? "" : "s");
+
+    $("#pc-minus").disabled =
+      state.checkoutPending ||
+      state.quantity <= 1;
+
+    $("#pc-plus").disabled =
+      state.checkoutPending ||
+      state.quantity >= PC.maxQuantity;
   }
 
   function openModal() {
@@ -225,65 +279,221 @@
     state.quantity = 1;
 
     $("#pc-overlay").hidden = false;
-    document.body.classList.add("pc-modal-open");
+
+    document.body.classList.add(
+      "pc-modal-open"
+    );
 
     updateModal();
   }
 
   function closeModal() {
+    if (state.checkoutPending) return;
+
     $("#pc-overlay").hidden = true;
-    document.body.classList.remove("pc-modal-open");
+
+    document.body.classList.remove(
+      "pc-modal-open"
+    );
+  }
+
+  function getCheckoutItems() {
+    return selectedImages().map(image => ({
+      imageId: image.id,
+      imageUrl: image.url,
+      label: image.label,
+      printSize: image.format,
+      quantity: state.quantity,
+      finish: "gloss"
+    }));
+  }
+
+  function setCheckoutPending(pending) {
+    state.checkoutPending = pending;
+
+    const button = $("#pc-checkout");
+
+    if (button) {
+      button.disabled = pending;
+
+      button.textContent = pending
+        ? "Preparing Checkout..."
+        : "Continue to Checkout";
+    }
+
+    const closeButton = $(".pc-close");
+
+    if (closeButton) {
+      closeButton.disabled = pending;
+    }
+
+    updateModal();
+  }
+
+  async function startCheckout() {
+    if (state.checkoutPending) return;
+
+    const items = getCheckoutItems();
+
+    if (!items.length) {
+      alert("No printable photos were selected.");
+      return;
+    }
+
+    // 2x6 is reserved for future fulfillment support.
+    if (items.some(item => item.printSize === "2x6")) {
+      alert(
+        "2×6 print ordering is not available yet."
+      );
+      return;
+    }
+
+    setCheckoutPending(true);
+
+    try {
+      const response = await fetch(
+        PC.apiBase +
+          "/.netlify/functions/create-checkout",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            source: "snappic-print-commerce",
+            selection: state.selection,
+            items: items
+          })
+        }
+      );
+
+      let data;
+
+      try {
+        data = await response.json();
+      } catch (_) {
+        throw new Error(
+          "Checkout returned an invalid response."
+        );
+      }
+
+      if (!response.ok || !data.checkoutUrl) {
+        throw new Error(
+          data.error ||
+          "Unable to create checkout session."
+        );
+      }
+
+      const checkoutURL = new URL(
+        data.checkoutUrl
+      );
+
+      if (
+        checkoutURL.protocol !== "https:" ||
+        checkoutURL.hostname !==
+          "checkout.stripe.com"
+      ) {
+        throw new Error(
+          "Checkout returned an unexpected URL."
+        );
+      }
+
+      window.location.assign(
+        checkoutURL.toString()
+      );
+
+    } catch (error) {
+      console.error(
+        "[Print Commerce] Checkout error:",
+        error
+      );
+
+      alert(
+        "We couldn't start checkout.\n\n" +
+        error.message +
+        "\n\nPlease try again."
+      );
+
+      setCheckoutPending(false);
+    }
   }
 
   function buildUI() {
     if ($("#pc-buy-button")) return;
 
     const host = $(".photo-gif-cover");
+
     if (!host) return;
 
-    const button = document.createElement("button");
+    const button =
+      document.createElement("button");
+
     button.id = "pc-buy-button";
     button.type = "button";
-    button.textContent = "Order Additional Prints";
-    button.addEventListener("click", openModal);
 
-    const buttonWrap = document.createElement("div");
-    buttonWrap.className = "pc-button-wrap";
+    button.textContent =
+      "Order Additional Prints";
+
+    button.addEventListener(
+      "click",
+      openModal
+    );
+
+    const buttonWrap =
+      document.createElement("div");
+
+    buttonWrap.className =
+      "pc-button-wrap";
+
     buttonWrap.appendChild(button);
     host.appendChild(buttonWrap);
 
-    const overlay = document.createElement("div");
+    const overlay =
+      document.createElement("div");
+
     overlay.id = "pc-overlay";
     overlay.hidden = true;
 
     overlay.innerHTML = `
-      <div class="pc-dialog" role="dialog"
+      <div class="pc-dialog"
+           role="dialog"
            aria-modal="true"
            aria-label="Order Additional Prints">
 
-        <button type="button" class="pc-close"
-                aria-label="Close">×</button>
+        <button
+          type="button"
+          class="pc-close"
+          aria-label="Close">×</button>
 
-        <h2 class="pc-title">Order Additional Prints</h2>
+        <h2 class="pc-title">
+          Order Additional Prints
+        </h2>
 
         <p class="pc-description">
           Get extra copies of your event photo
           delivered to your door.
         </p>
 
-        <div id="pc-choices" class="pc-choices"></div>
+        <div
+          id="pc-choices"
+          class="pc-choices"></div>
 
-        <div id="pc-preview-area"
-             class="pc-preview-wrap"></div>
+        <div
+          id="pc-preview-area"
+          class="pc-preview-wrap"></div>
 
         <div class="pc-details">
           <div>
-            <span class="pc-muted">Print format</span>
+            <span class="pc-muted">
+              Print format
+            </span>
             <strong id="pc-format"></strong>
           </div>
 
           <div>
-            <span class="pc-muted">Price per selection</span>
+            <span class="pc-muted">
+              Price per selection
+            </span>
             <strong id="pc-unit-price"></strong>
           </div>
         </div>
@@ -292,23 +502,35 @@
           <span>Quantity / Sets</span>
 
           <div class="pc-stepper">
-            <button id="pc-minus" type="button">−</button>
-            <strong id="pc-quantity">1</strong>
-            <button id="pc-plus" type="button">+</button>
+            <button
+              id="pc-minus"
+              type="button">−</button>
+
+            <strong id="pc-quantity">
+              1
+            </strong>
+
+            <button
+              id="pc-plus"
+              type="button">+</button>
           </div>
         </div>
 
         <div class="pc-total">
           <div>
             <span>Subtotal</span>
-            <div id="pc-print-count"
-                 class="pc-muted"></div>
+
+            <div
+              id="pc-print-count"
+              class="pc-muted"></div>
           </div>
 
           <strong id="pc-subtotal"></strong>
         </div>
 
-        <button id="pc-checkout" type="button">
+        <button
+          id="pc-checkout"
+          type="button">
           Continue to Checkout
         </button>
 
@@ -321,51 +543,60 @@
     document.body.appendChild(overlay);
 
     $(".pc-close", overlay).addEventListener(
-      "click", closeModal
+      "click",
+      closeModal
     );
 
-    overlay.addEventListener("click", event => {
-      if (event.target === overlay) closeModal();
-    });
+    overlay.addEventListener(
+      "click",
+      event => {
+        if (event.target === overlay) {
+          closeModal();
+        }
+      }
+    );
 
-    $("#pc-minus").addEventListener("click", () => {
-      state.quantity = Math.max(
-        1,
-        state.quantity - 1
-      );
-      updateModal();
-    });
+    $("#pc-minus").addEventListener(
+      "click",
+      () => {
+        if (state.checkoutPending) return;
 
-    $("#pc-plus").addEventListener("click", () => {
-      state.quantity = Math.min(
-        PC.maxQuantity,
-        state.quantity + 1
-      );
-      updateModal();
-    });
+        state.quantity = Math.max(
+          1,
+          state.quantity - 1
+        );
 
-    $("#pc-checkout").addEventListener("click", () => {
-      const images = selectedImages();
+        updateModal();
+      }
+    );
 
-      const subtotal = images.reduce(
-        (sum, image) => sum + PC.prices[image.format],
-        0
-      ) * state.quantity;
+    $("#pc-plus").addEventListener(
+      "click",
+      () => {
+        if (state.checkoutPending) return;
 
-      alert(
-        "Print Commerce — Test Mode\n\n" +
-        "Selection: " + state.selection + "\n" +
-        "Quantity: " + state.quantity + "\n" +
-        "Total prints: " +
-        (images.length * state.quantity) + "\n" +
-        "Subtotal: " + money(subtotal) +
-        "\n\nStripe checkout will be connected later."
-      );
-    });
+        state.quantity = Math.min(
+          PC.maxQuantity,
+          state.quantity + 1
+        );
 
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape") closeModal();
-    });
+        updateModal();
+      }
+    );
+
+    $("#pc-checkout").addEventListener(
+      "click",
+      startCheckout
+    );
+
+    document.addEventListener(
+      "keydown",
+      event => {
+        if (event.key === "Escape") {
+          closeModal();
+        }
+      }
+    );
   }
 
   async function init() {
@@ -374,8 +605,15 @@
       PC.version
     );
 
-    for (let attempt = 0; attempt < 15; attempt++) {
-      if ($(".photo-gif-cover") && $("#guest_main_url")) {
+    for (
+      let attempt = 0;
+      attempt < 15;
+      attempt++
+    ) {
+      if (
+        $(".photo-gif-cover") &&
+        $("#guest_main_url")
+      ) {
         break;
       }
 
@@ -384,48 +622,66 @@
       );
     }
 
-    // Wait for Snappic to finish loading AI/original media.
-let detectedImages = [];
+    // Wait for Snappic to finish loading
+    // AI and original media.
 
-for (let attempt = 0; attempt < 20; attempt++) {
-  detectedImages = await prepareImages();
+    let detectedImages = [];
 
-  const hasOriginalTab =
-    !!document.querySelector('a#ai[data-toggle="pill"]') &&
-    !!document.querySelector('a#photo[data-toggle="pill"]');
+    for (
+      let attempt = 0;
+      attempt < 20;
+      attempt++
+    ) {
+      detectedImages =
+        await prepareImages();
 
-  const originalElement =
-    document.querySelector("#guest_second_url");
+      const hasOriginalTab =
+        !!document.querySelector(
+          'a#ai[data-toggle="pill"]'
+        ) &&
+        !!document.querySelector(
+          'a#photo[data-toggle="pill"]'
+        );
 
-  const originalReady =
-    originalElement?.naturalWidth > 0 &&
-    originalElement?.naturalHeight > 0;
+      const originalElement =
+        document.querySelector(
+          "#guest_second_url"
+        );
 
-  // Standard photo: one image is expected.
-  // AI photo: wait until both images are ready.
-  if (
-    detectedImages.length > 0 &&
-    (!hasOriginalTab ||
-      (originalReady && detectedImages.length === 2))
-  ) {
-    break;
-  }
+      const originalReady =
+        originalElement?.naturalWidth > 0 &&
+        originalElement?.naturalHeight > 0;
 
-  await new Promise(resolve =>
-    setTimeout(resolve, 250)
-  );
-}
+      if (
+        detectedImages.length > 0 &&
+        (
+          !hasOriginalTab ||
+          (
+            originalReady &&
+            detectedImages.length === 2
+          )
+        )
+      ) {
+        break;
+      }
 
-state.images = detectedImages;
+      await new Promise(resolve =>
+        setTimeout(resolve, 250)
+      );
+    }
 
-if (!state.images.length) {
-  console.log(
-    "[Print Commerce] No supported printable media."
-  );
-  return;
-}
+    state.images = detectedImages;
 
-buildUI();
+    if (!state.images.length) {
+      console.log(
+        "[Print Commerce] " +
+        "No supported printable media."
+      );
+
+      return;
+    }
+
+    buildUI();
 
     console.log(
       "[Print Commerce] Ready:",
@@ -435,7 +691,10 @@ buildUI();
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
+    document.addEventListener(
+      "DOMContentLoaded",
+      init
+    );
   } else {
     init();
   }
