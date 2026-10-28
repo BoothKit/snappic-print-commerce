@@ -1,8 +1,6 @@
 
 "use strict";
 
-const crypto = require("node:crypto");
-
 const PRODIGI_API =
   "https://api.sandbox.prodigi.com/v4.0/orders";
 
@@ -18,25 +16,27 @@ const HEADERS = {
   "Cache-Control": "no-store"
 };
 
+function respond(statusCode, data) {
+  return {
+    statusCode,
+    headers: HEADERS,
+    body: JSON.stringify(data, null, 2)
+  };
+}
+
 exports.handler = async function (event) {
   if (event.httpMethod !== "GET") {
-    return {
-      statusCode: 405,
-      headers: HEADERS,
-      body: JSON.stringify({
-        error: "Method not allowed"
-      })
-    };
+    return respond(405, {
+      success: false,
+      error: "Method not allowed"
+    });
   }
 
   if (!process.env.PRODIGI_API_KEY) {
-    return {
-      statusCode: 500,
-      headers: HEADERS,
-      body: JSON.stringify({
-        error: "Prodigi API key is missing"
-      })
-    };
+    return respond(500, {
+      success: false,
+      error: "Prodigi API key is missing"
+    });
   }
 
   const order = {
@@ -76,46 +76,98 @@ exports.handler = async function (event) {
   };
 
   try {
+    console.log(
+      "[Prodigi Test] Submitting sandbox order"
+    );
+
     const response = await fetch(PRODIGI_API, {
       method: "POST",
       headers: {
         "X-API-Key": process.env.PRODIGI_API_KEY,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
       },
       body: JSON.stringify(order)
     });
 
-    const result = await response.json();
+    const rawResponse = await response.text();
 
-    return {
-      statusCode: response.ok ? 200 : 502,
-      headers: HEADERS,
-      body: JSON.stringify({
+    let result;
+
+    try {
+      result = JSON.parse(rawResponse);
+    } catch (error) {
+      result = {
+        rawResponse: rawResponse
+      };
+    }
+
+    // Log the complete response for debugging.
+    console.log(
+      "[Prodigi Test] HTTP Status:",
+      response.status
+    );
+
+    console.log(
+      "[Prodigi Test] Full response:",
+      JSON.stringify(result, null, 2)
+    );
+
+    const outcome = result.outcome || null;
+
+    const orderId =
+      result.order?.id ||
+      result.id ||
+      null;
+
+    const issues =
+      result.order?.status?.issues ||
+      result.issues ||
+      result.validationErrors ||
+      result.errors ||
+      [];
+
+    let message = "Review Prodigi response.";
+
+    if (outcome === "AlreadyExists") {
+      message =
+        "Duplicate prevented successfully!";
+    } else if (
+      outcome === "Created" ||
+      outcome === "CreatedWithIssues"
+    ) {
+      message =
+        "Sandbox order created. Run again to test duplicate protection.";
+    } else if (outcome === "ValidationFailed") {
+      message =
+        "Prodigi rejected the order. Check details for the validation errors.";
+    }
+
+    return respond(
+      response.ok ? 200 : 502,
+      {
         success: response.ok,
         prodigiStatus: response.status,
-        outcome: result.outcome,
-        orderId: result.order?.id || null,
-        message:
-          result.outcome === "AlreadyExists"
-            ? "Duplicate prevented successfully!"
-            : result.outcome === "Created"
-              ? "Sandbox order created. Run again."
-              : "Review Prodigi response.",
-        issues:
-          result.order?.status?.issues ||
-          result.issues ||
-          []
-      })
-    };
+        outcome: outcome,
+        orderId: orderId,
+        message: message,
+        issues: issues,
+
+        // Include the complete Prodigi response
+        // temporarily for debugging.
+        details: result
+      }
+    );
 
   } catch (error) {
-    return {
-      statusCode: 502,
-      headers: HEADERS,
-      body: JSON.stringify({
-        success: false,
-        error: error.message
-      })
-    };
+    console.error(
+      "[Prodigi Test] Request failed:",
+      error
+    );
+
+    return respond(502, {
+      success: false,
+      error: error.message
+    });
   }
 };
