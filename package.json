@@ -1,0 +1,9 @@
+
+{
+  "name": "snappic-print-commerce",
+  "version": "0.4.0",
+  "private": true,
+  "dependencies": {
+    "@netlify/blobs": "^10.0.0"
+  }
+}
