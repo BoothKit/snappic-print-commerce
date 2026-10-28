@@ -384,16 +384,48 @@
       );
     }
 
-    state.images = await prepareImages();
+    // Wait for Snappic to finish loading AI/original media.
+let detectedImages = [];
 
-    if (!state.images.length) {
-      console.log(
-        "[Print Commerce] No supported printable media."
-      );
-      return;
-    }
+for (let attempt = 0; attempt < 20; attempt++) {
+  detectedImages = await prepareImages();
 
-    buildUI();
+  const hasOriginalTab =
+    !!document.querySelector('a#ai[data-toggle="pill"]') &&
+    !!document.querySelector('a#photo[data-toggle="pill"]');
+
+  const originalElement =
+    document.querySelector("#guest_second_url");
+
+  const originalReady =
+    originalElement?.naturalWidth > 0 &&
+    originalElement?.naturalHeight > 0;
+
+  // Standard photo: one image is expected.
+  // AI photo: wait until both images are ready.
+  if (
+    detectedImages.length > 0 &&
+    (!hasOriginalTab ||
+      (originalReady && detectedImages.length === 2))
+  ) {
+    break;
+  }
+
+  await new Promise(resolve =>
+    setTimeout(resolve, 250)
+  );
+}
+
+state.images = detectedImages;
+
+if (!state.images.length) {
+  console.log(
+    "[Print Commerce] No supported printable media."
+  );
+  return;
+}
+
+buildUI();
 
     console.log(
       "[Print Commerce] Ready:",
