@@ -1,9 +1,12 @@
 
 "use strict";
 
-const { getStore } = require("@netlify/blobs");
+const {
+  getStore,
+  connectLambda
+} = require("@netlify/blobs");
 
-exports.handler = async function (event) {
+exports.handler = async function (event, context) {
   if (event.httpMethod !== "GET") {
     return {
       statusCode: 405,
@@ -14,6 +17,9 @@ exports.handler = async function (event) {
   }
 
   try {
+    // Required for Lambda-compatible Netlify Functions.
+    connectLambda(event);
+
     const store = getStore("print-commerce-orders");
 
     const key = "setup-test";
