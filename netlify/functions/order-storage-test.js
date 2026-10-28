@@ -33,9 +33,8 @@ exports.handler = async function (event, context) {
     await store.setJSON(key, value);
 
     const saved = await store.get(key, {
-      type: "json",
-      consistency: "strong"
-    });
+  type: "json"
+});
 
     return {
       statusCode: 200,
