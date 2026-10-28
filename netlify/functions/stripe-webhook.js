@@ -263,7 +263,10 @@ exports.handler = async function (event) {
       stripeEvent.type ===
       "checkout.session.async_payment_failed";
 
-    const store = getStore("print-commerce-orders");
+    // Initialize Netlify Blobs for classic Lambda functions.
+connectLambda(event);
+
+const store = getStore("print-commerce-orders");
 
     // Use the Checkout Session ID as the stable record key.
     const orderKey = `order-${session.id}`;
