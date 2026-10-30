@@ -2,7 +2,12 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { getStore, connectLambda } = require("@netlify/blobs");
+const {
+  getStore,
+  connectLambda
+} = require("@netlify/blobs");
+
+const ORDER_STORE = "print-commerce-orders";
 
 const HEADERS = {
   "Content-Type": "application/json",
@@ -17,7 +22,11 @@ function respond(statusCode, data) {
   };
 }
 
-function verifyStripeSignature(payload, signatureHeader, secret) {
+function verifyStripeSignature(
+  payload,
+  signatureHeader,
+  secret
+) {
   if (!signatureHeader || !secret) return false;
 
   const parts = signatureHeader.split(",");
@@ -26,6 +35,7 @@ function verifyStripeSignature(payload, signatureHeader, secret) {
 
   for (const part of parts) {
     const separator = part.indexOf("=");
+
     if (separator === -1) continue;
 
     const key = part.slice(0, separator).trim();
@@ -35,10 +45,15 @@ function verifyStripeSignature(payload, signatureHeader, secret) {
     if (key === "v1") signatures.push(value);
   }
 
-  if (!timestamp || !signatures.length) return false;
+  if (!timestamp || !signatures.length) {
+    return false;
+  }
 
   const timestampNumber = Number(timestamp);
-  if (!Number.isSafeInteger(timestampNumber)) return false;
+
+  if (!Number.isSafeInteger(timestampNumber)) {
+    return false;
+  }
 
   const now = Math.floor(Date.now() / 1000);
 
@@ -52,9 +67,14 @@ function verifyStripeSignature(payload, signatureHeader, secret) {
     .digest();
 
   return signatures.some(signature => {
-    if (!/^[0-9a-f]{64}$/i.test(signature)) return false;
+    if (!/^[0-9a-f]{64}$/i.test(signature)) {
+      return false;
+    }
 
-    const received = Buffer.from(signature, "hex");
+    const received = Buffer.from(
+      signature,
+      "hex"
+    );
 
     return (
       received.length === expected.length &&
@@ -63,20 +83,49 @@ function verifyStripeSignature(payload, signatureHeader, secret) {
   });
 }
 
+function getSiteURL() {
+  if (!process.env.URL) {
+    throw new Error(
+      "Netlify URL is not configured"
+    );
+  }
+
+  const url = new URL(process.env.URL);
+
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== "/"
+  ) {
+    throw new Error(
+      "Invalid Netlify URL"
+    );
+  }
+
+  return url.origin;
+}
+
 async function retrieveStripeSession(sessionId) {
   const secretKey = process.env.STRIPE_SECRET_KEY;
 
   if (!secretKey) {
-    throw new Error("STRIPE_SECRET_KEY is missing");
+    throw new Error(
+      "STRIPE_SECRET_KEY is missing"
+    );
   }
 
   const response = await fetch(
-    `https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`,
+    "https://api.stripe.com/v1/checkout/sessions/" +
+      encodeURIComponent(sessionId),
     {
       method: "GET",
       headers: {
         Authorization: `Bearer ${secretKey}`
-      }
+      },
+      signal: AbortSignal.timeout(15000)
     }
   );
 
@@ -84,9 +133,8 @@ async function retrieveStripeSession(sessionId) {
 
   if (!response.ok) {
     throw new Error(
-      `Stripe session retrieval failed: ${
-        result.error?.message || response.status
-      }`
+      "Stripe session retrieval failed: " +
+      (result.error?.message || response.status)
     );
   }
 
@@ -94,14 +142,18 @@ async function retrieveStripeSession(sessionId) {
 }
 
 function reconstructManifest(metadata) {
-  const chunkCount = Number(metadata?.manifest_chunks);
+  const chunkCount = Number(
+    metadata?.manifest_chunks
+  );
 
   if (
     !Number.isInteger(chunkCount) ||
     chunkCount < 1 ||
     chunkCount > 20
   ) {
-    throw new Error("Invalid order manifest chunk count");
+    throw new Error(
+      "Invalid order manifest chunk count"
+    );
   }
 
   let serialized = "";
@@ -110,7 +162,9 @@ function reconstructManifest(metadata) {
     const chunk = metadata[`manifest_${i}`];
 
     if (typeof chunk !== "string") {
-      throw new Error(`Missing order manifest chunk ${i}`);
+      throw new Error(
+        `Missing order manifest chunk ${i}`
+      );
     }
 
     serialized += chunk;
@@ -121,9 +175,12 @@ function reconstructManifest(metadata) {
   if (
     !manifest ||
     !Array.isArray(manifest.items) ||
-    manifest.items.length === 0
+    manifest.items.length < 1 ||
+    manifest.items.length > 2
   ) {
-    throw new Error("Order manifest is empty or invalid");
+    throw new Error(
+      "Invalid order manifest"
+    );
   }
 
   return manifest;
@@ -145,7 +202,10 @@ function getShippingDetails(session) {
 
   return {
     name,
-    email: customer.email || session.customer_email || null,
+    email:
+      customer.email ||
+      session.customer_email ||
+      null,
     phone: customer.phone || null,
     address: address
       ? {
@@ -153,14 +213,97 @@ function getShippingDetails(session) {
           line2: address.line2 || null,
           city: address.city || null,
           state: address.state || null,
-          postal_code: address.postal_code || null,
+          postal_code:
+            address.postal_code || null,
           country: address.country || null
         }
       : null
   };
 }
 
-exports.handler = async function (event) {
+function shouldDispatch(order) {
+  if (
+    !order ||
+    order.paymentStatus !== "paid"
+  ) {
+    return false;
+  }
+
+  const fulfillment = order.fulfillment || {};
+
+  // Never dispatch an order already known
+  // to exist in Prodigi.
+  if (fulfillment.prodigiOrderId) {
+    return false;
+  }
+
+  // Do not retry uncertain submissions.
+  // They require reconciliation first.
+  if (
+    [
+      "submitting",
+      "submitted",
+      "needs_review"
+    ].includes(fulfillment.status)
+  ) {
+    return false;
+  }
+
+  // Only untouched pending orders may be
+  // automatically dispatched.
+  return (
+    fulfillment.status === "pending" &&
+    (fulfillment.attempts || 0) === 0
+  );
+}
+
+async function dispatchFulfillment(sessionId) {
+  const token =
+    process.env.FULFILLMENT_WORKER_TOKEN;
+
+  if (!token) {
+    throw new Error(
+      "FULFILLMENT_WORKER_TOKEN is missing"
+    );
+  }
+
+  const endpoint =
+    getSiteURL() +
+    "/.netlify/functions/fulfill-order-background";
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-fulfillment-token": token
+    },
+    body: JSON.stringify({
+      sessionId
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+
+  // Netlify background functions acknowledge
+  // accepted jobs with HTTP 202.
+  //
+  // This does NOT mean Prodigi fulfillment
+  // has finished.
+  if (response.status !== 202) {
+    throw new Error(
+      "Background worker dispatch failed: HTTP " +
+      response.status
+    );
+  }
+
+  console.log(
+    "[Stripe Webhook] Fulfillment job accepted",
+    { sessionId }
+  );
+
+  return true;
+}
+
+exports.handler = async function(event) {
   if (event.httpMethod !== "POST") {
     return {
       ...respond(405, {
@@ -173,10 +316,13 @@ exports.handler = async function (event) {
     };
   }
 
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  const webhookSecret =
+    process.env.STRIPE_WEBHOOK_SECRET;
 
   if (!webhookSecret) {
-    console.error("Stripe webhook secret is missing");
+    console.error(
+      "Stripe webhook secret is missing"
+    );
 
     return respond(500, {
       error: "Webhook not configured"
@@ -185,7 +331,10 @@ exports.handler = async function (event) {
 
   try {
     const rawBody = event.isBase64Encoded
-      ? Buffer.from(event.body || "", "base64").toString("utf8")
+      ? Buffer.from(
+          event.body || "",
+          "base64"
+        ).toString("utf8")
       : event.body || "";
 
     const signature =
@@ -199,7 +348,9 @@ exports.handler = async function (event) {
         webhookSecret
       )
     ) {
-      console.warn("Invalid Stripe webhook signature");
+      console.warn(
+        "Invalid Stripe webhook signature"
+      );
 
       return respond(400, {
         error: "Invalid webhook signature"
@@ -214,14 +365,19 @@ exports.handler = async function (event) {
       "checkout.session.async_payment_failed"
     ];
 
-    if (!supportedEvents.includes(stripeEvent.type)) {
+    if (
+      !supportedEvents.includes(
+        stripeEvent.type
+      )
+    ) {
       return respond(200, {
         received: true,
         ignored: true
       });
     }
 
-    const webhookSession = stripeEvent.data?.object;
+    const webhookSession =
+      stripeEvent.data?.object;
 
     if (
       webhookSession?.metadata?.source !==
@@ -230,18 +386,23 @@ exports.handler = async function (event) {
       return respond(200, {
         received: true,
         ignored: true,
-        reason: "Not a Print Commerce transaction"
+        reason:
+          "Not a Print Commerce transaction"
       });
     }
 
     if (
-      !webhookSession.id ||
-      !webhookSession.id.startsWith("cs_")
+      typeof webhookSession.id !== "string" ||
+      !/^cs_test_[A-Za-z0-9]+$/.test(
+        webhookSession.id
+      )
     ) {
-      throw new Error("Invalid Checkout Session ID");
+      throw new Error(
+        "Valid Stripe test session required"
+      );
     }
 
-    // Retrieve authoritative session details from Stripe.
+    // Always retrieve authoritative details.
     const session = await retrieveStripeSession(
       webhookSession.id
     );
@@ -256,6 +417,15 @@ exports.handler = async function (event) {
       });
     }
 
+    if (
+      session.id !== webhookSession.id ||
+      session.livemode !== false
+    ) {
+      throw new Error(
+        "Stripe session verification failed"
+      );
+    }
+
     const paymentSucceeded =
       session.payment_status === "paid";
 
@@ -263,25 +433,43 @@ exports.handler = async function (event) {
       stripeEvent.type ===
       "checkout.session.async_payment_failed";
 
-    // Initialize Netlify Blobs for classic Lambda functions.
-connectLambda(event);
+    connectLambda(event);
 
-const store = getStore("print-commerce-orders");
-
-    // Use the Checkout Session ID as the stable record key.
+    const store = getStore(ORDER_STORE);
     const orderKey = `order-${session.id}`;
 
-    const existing = await store.get(orderKey, {
-      type: "json"
-    });
+    const existing = await store.get(
+      orderKey,
+      { type: "json" }
+    );
 
-    // Never downgrade an already-paid order because
-    // webhook events can arrive out of order.
+    // An already-paid order may have been
+    // fulfilled or may still be pending.
+    //
+    // Never overwrite its fulfillment state.
     if (existing?.paymentStatus === "paid") {
+      let dispatched = false;
+
+      if (shouldDispatch(existing)) {
+        await dispatchFulfillment(session.id);
+        dispatched = true;
+      }
+
+      console.log(
+        "[Stripe Webhook] Existing paid order",
+        {
+          sessionId: session.id,
+          fulfillmentStatus:
+            existing.fulfillment?.status || null,
+          dispatched
+        }
+      );
+
       return respond(200, {
         received: true,
         printCommerce: true,
         alreadyRecorded: true,
+        dispatched,
         sessionId: session.id
       });
     }
@@ -303,18 +491,21 @@ const store = getStore("print-commerce-orders");
       );
     }
 
-    const shipping = getShippingDetails(session);
+    const shipping = getShippingDetails(
+      session
+    );
 
     if (paymentSucceeded) {
       if (
         !shipping.name ||
         !shipping.address?.line1 ||
         !shipping.address?.city ||
+        !shipping.address?.state ||
         !shipping.address?.postal_code ||
-        !shipping.address?.country
+        shipping.address?.country !== "US"
       ) {
         throw new Error(
-          "Paid order is missing required shipping details"
+          "Paid order is missing required US shipping details"
         );
       }
     }
@@ -326,7 +517,8 @@ const store = getStore("print-commerce-orders");
       version: 1,
 
       sessionId: session.id,
-      paymentIntentId: session.payment_intent || null,
+      paymentIntentId:
+        session.payment_intent || null,
 
       stripeEventId: stripeEvent.id,
       stripeEventType: stripeEvent.type,
@@ -339,7 +531,6 @@ const store = getStore("print-commerce-orders");
       currency: session.currency,
 
       shipping,
-
       manifest,
 
       fulfillment: {
@@ -352,22 +543,36 @@ const store = getStore("print-commerce-orders");
         lastError: null
       },
 
-      createdAt: existing?.createdAt || now,
+      createdAt:
+        existing?.createdAt || now,
       updatedAt: now
     };
 
-    // Save the record before acknowledging the webhook.
-    await store.setJSON(orderKey, record);
+    // Save payment details before dispatch.
+    await store.setJSON(
+      orderKey,
+      record
+    );
 
     console.log(
-      "Print Commerce order recorded:",
+      "[Stripe Webhook] Order recorded",
       {
         sessionId: session.id,
-        paymentStatus: record.paymentStatus,
-        itemCount: manifest?.items?.length || 0,
-        fulfillmentStatus: record.fulfillment.status
+        paymentStatus:
+          record.paymentStatus,
+        itemCount:
+          manifest?.items?.length || 0,
+        fulfillmentStatus:
+          record.fulfillment.status
       }
     );
+
+    let dispatched = false;
+
+    if (shouldDispatch(record)) {
+      await dispatchFulfillment(session.id);
+      dispatched = true;
+    }
 
     return respond(200, {
       received: true,
@@ -375,16 +580,18 @@ const store = getStore("print-commerce-orders");
       paymentSucceeded,
       paymentFailed,
       orderRecorded: true,
+      dispatched,
       sessionId: session.id
     });
 
   } catch (error) {
     console.error(
-      "Webhook processing error:",
+      "[Stripe Webhook] Processing error",
       error.message
     );
 
-    // A non-2xx response lets Stripe retry delivery.
+    // Stripe may retry webhook delivery
+    // when this endpoint returns non-2xx.
     return respond(500, {
       error: "Webhook processing failed"
     });
