@@ -221,10 +221,45 @@ async function verifyHostedImages(
 
     seen.add(item.id);
 
-    const delivery = await images.get(
-      `delivery/${sessionId}/${item.id}`,
-      { type: "json" }
+    // Allow newly created delivery records time to become
+// visible across Netlify function invocations.
+
+let delivery = null;
+
+for (let attempt = 1; attempt <= 12; attempt++) {
+  delivery = await images.get(
+    `delivery/${sessionId}/${item.id}`,
+    { type: "json" }
+  );
+
+  if (delivery?.deliveryURL) {
+    console.log(
+      "[Fulfillment Worker] Image delivery record found",
+      {
+        sessionId,
+        imageId: item.id,
+        attempt
+      }
     );
+
+    break;
+  }
+
+  if (attempt < 12) {
+    console.warn(
+      "[Fulfillment Worker] Waiting for image delivery record",
+      {
+        sessionId,
+        imageId: item.id,
+        attempt
+      }
+    );
+
+    await new Promise(resolve =>
+      setTimeout(resolve, 5000)
+    );
+  }
+}
 
     if (
       !delivery ||
