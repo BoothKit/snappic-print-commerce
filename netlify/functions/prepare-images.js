@@ -97,10 +97,15 @@ function validateRedirectURL(value) {
   ];
 
   if (!allowedHosts.includes(url.hostname)) {
-    throw new Error(
-      "Image redirected to an unsupported host"
-    );
-  }
+  console.error("[Image Redirect Validation]", {
+    hostname: url.hostname,
+    protocol: url.protocol
+  });
+
+  throw new Error(
+    "Image redirected to an unsupported host"
+  );
+}
 
   return url;
 }
