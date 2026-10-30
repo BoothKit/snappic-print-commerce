@@ -386,10 +386,7 @@ exports.handler = async function(event) {
       // Use the original Netlify Blobs read format.
       order = await orders.get(
   `order-${sessionId}`,
-  {
-    type: "json",
-    consistency: "strong"
-  }
+  { type: "json" }
 );
     } catch (error) {
       console.error(
