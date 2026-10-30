@@ -324,11 +324,20 @@ await images.set(imageKey, buffer, {
 });
 
 const deliveryURL =
-  `https://${event.headers.host}` +
+  `https://snappic-print-commerce.netlify.app` +
   `/.netlify/functions/serve-image` +
   `?sessionId=${encodeURIComponent(sessionId)}` +
   `&imageId=${encodeURIComponent(item.id)}` +
   `&token=${accessToken}`;
+
+await images.setJSON(
+  `delivery/${sessionId}/${item.id}`,
+  {
+    deliveryURL,
+    imageKey,
+    createdAt: new Date().toISOString()
+  }
+);
 
       results.push({
   imageId: item.id,
