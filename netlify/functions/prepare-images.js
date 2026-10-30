@@ -67,7 +67,13 @@ function validateSourceURL(value) {
   /^\/photo\/still\/[A-Za-z0-9_/-]+\/?$/.test(url.pathname)
 )
   ) {
-    throw new Error("Unsupported Snappic image URL");
+    console.error("[Image URL Validation]", {
+  hostname: url.hostname,
+  pathname: url.pathname,
+  protocol: url.protocol
+});
+
+throw new Error("Unsupported Snappic image URL");
   }
 
   return url;
