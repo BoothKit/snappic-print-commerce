@@ -372,10 +372,38 @@ exports.handler = async function(event) {
 
   const orders = getStore(ORDER_STORE);
 
-  const order = await orders.get(
+  let order = null;
+
+for (let attempt = 1; attempt <= 5; attempt++) {
+  order = await orders.get(
     `order-${sessionId}`,
-    { type: "json" }
+    { type: "json", consistency: "strong" }
   );
+
+  const validOrder =
+    order?.application === "snappic-print-commerce" &&
+    order?.sessionId === sessionId &&
+    order?.paymentStatus === "paid";
+
+  if (validOrder) {
+    console.log(
+      "[Fulfillment Worker] Paid order found",
+      { sessionId, attempt }
+    );
+    break;
+  }
+
+  console.warn(
+    "[Fulfillment Worker] Paid order not visible yet",
+    { sessionId, attempt }
+  );
+
+  if (attempt < 5) {
+    await new Promise(resolve =>
+      setTimeout(resolve, 2000)
+    );
+  }
+}
 
   if (
     !order ||
