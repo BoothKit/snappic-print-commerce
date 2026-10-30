@@ -64,7 +64,7 @@ function validateSourceURL(value) {
     url.password ||
     !(
   /^\/media\/download\/photo\/[A-Za-z0-9_-]+\/?$/.test(url.pathname) ||
-  /^\/photo\/still\/[A-Za-z0-9_/-]+\/?$/.test(url.pathname)
+  /^\/photo\/still\/[A-Za-z0-9_-]+\.jpe?g$/i.test(url.pathname)
 )
   ) {
     console.error("[Image URL Validation]", {
