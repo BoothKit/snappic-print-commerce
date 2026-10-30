@@ -62,9 +62,10 @@ function validateSourceURL(value) {
     url.port ||
     url.username ||
     url.password ||
-    !/^\/media\/download\/photo\/[A-Za-z0-9_-]+\/?$/.test(
-      url.pathname
-    )
+    !(
+  /^\/media\/download\/photo\/[A-Za-z0-9_-]+\/?$/.test(url.pathname) ||
+  /^\/photo\/still\/[A-Za-z0-9_/-]+\/?$/.test(url.pathname)
+)
   ) {
     throw new Error("Unsupported Snappic image URL");
   }
