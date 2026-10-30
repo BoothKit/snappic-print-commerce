@@ -304,24 +304,39 @@ exports.handler = async function(event) {
       );
 
       const imageKey =
-        `images/${sessionId}/${item.id}.jpg`;
+  `images/${sessionId}/${item.id}.jpg`;
 
-      await images.set(imageKey, buffer, {
-        metadata: {
-          contentType: "image/jpeg",
-          sessionId,
-          imageId: item.id,
-          uploadedAt:
-            new Date().toISOString()
-        }
-      });
+const accessToken = crypto.randomBytes(32).toString("hex");
+
+const accessTokenHash = crypto
+  .createHash("sha256")
+  .update(accessToken)
+  .digest("hex");
+
+await images.set(imageKey, buffer, {
+  metadata: {
+    contentType: "image/jpeg",
+    sessionId,
+    imageId: item.id,
+    accessTokenHash,
+    uploadedAt: new Date().toISOString()
+  }
+});
+
+const deliveryURL =
+  `https://${event.headers.host}` +
+  `/.netlify/functions/serve-image` +
+  `?sessionId=${encodeURIComponent(sessionId)}` +
+  `&imageId=${encodeURIComponent(item.id)}` +
+  `&token=${accessToken}`;
 
       results.push({
-        imageId: item.id,
-        stored: true,
-        bytes: buffer.length,
-        contentType: "image/jpeg"
-      });
+  imageId: item.id,
+  stored: true,
+  bytes: buffer.length,
+  contentType: "image/jpeg",
+  deliveryURL
+});
     }
 
     return respond(200, {
