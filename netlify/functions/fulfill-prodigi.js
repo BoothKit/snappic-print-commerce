@@ -7,6 +7,9 @@ const {
   connectLambda
 } = require("@netlify/blobs");
 
+const PRODIGI_API =
+  "https://api.sandbox.prodigi.com/v4.0/orders";
+
 const STORE_NAME = "print-commerce-orders";
 
 const PRODUCTS = {
@@ -48,12 +51,11 @@ function validateOrder(order, sessionId) {
     throw new Error("Order not found");
   }
 
-  if (order.application !== "snappic-print-commerce") {
-    throw new Error("Invalid order application");
-  }
-
-  if (order.sessionId !== sessionId) {
-    throw new Error("Session ID mismatch");
+  if (
+    order.application !== "snappic-print-commerce" ||
+    order.sessionId !== sessionId
+  ) {
+    throw new Error("Invalid order record");
   }
 
   if (order.paymentStatus !== "paid") {
@@ -80,7 +82,7 @@ function validateOrder(order, sessionId) {
     items.length < 1 ||
     items.length > 2
   ) {
-    throw new Error("Invalid order items");
+    throw new Error("Invalid print items");
   }
 
   let totalPrints = 0;
@@ -94,7 +96,7 @@ function validateOrder(order, sessionId) {
       typeof item.url !== "string" ||
       !item.url.startsWith("https://")
     ) {
-      throw new Error("Missing or invalid photo URL");
+      throw new Error("Invalid photo URL");
     }
 
     if (
@@ -102,7 +104,7 @@ function validateOrder(order, sessionId) {
       item.qty < 1 ||
       item.qty > 50
     ) {
-      throw new Error("Invalid print quantity");
+      throw new Error("Invalid quantity");
     }
 
     if (item.finish !== "gloss") {
@@ -123,8 +125,73 @@ function validateOrder(order, sessionId) {
   };
 }
 
+function buildProdigiOrder(order, sessionId) {
+  const validated = validateOrder(
+    order,
+    sessionId
+  );
+
+  const address = validated.address;
+  const shipping = order.shipping;
+
+  const recipientAddress = {
+    line1: address.line1,
+    postalOrZipCode: address.postal_code,
+    countryCode: address.country,
+    townOrCity: address.city,
+    stateOrCounty: address.state
+  };
+
+  // Prodigi rejects empty apartment/suite values.
+  if (
+    typeof address.line2 === "string" &&
+    address.line2.trim()
+  ) {
+    recipientAddress.line2 =
+      address.line2.trim();
+  }
+
+  const recipient = {
+    name: shipping.name,
+    address: recipientAddress
+  };
+
+  if (shipping.email) {
+    recipient.email = shipping.email;
+  }
+
+  if (shipping.phone) {
+    recipient.phone = shipping.phone;
+  }
+
+  const items = validated.items.map(item => ({
+    sku: PRODUCTS[item.size],
+    copies: item.qty,
+    sizing: "fillPrintArea",
+    attributes: {
+      finish: "gloss"
+    },
+    assets: [
+      {
+        printArea: "default",
+        url: item.url
+      }
+    ]
+  }));
+
+  return {
+    merchantReference:
+      `PC-${sessionId.slice(-24)}`,
+    idempotencyKey: sessionId,
+    shippingMethod: "Budget",
+    recipient,
+    items
+  };
+}
+
 exports.handler = async function(event) {
-  if (event.httpMethod !== "GET") {
+  // POST only: this function creates orders.
+  if (event.httpMethod !== "POST") {
     return respond(405, {
       error: "Method not allowed"
     });
@@ -136,8 +203,22 @@ exports.handler = async function(event) {
     });
   }
 
-  const sessionId =
-    event.queryStringParameters?.session;
+  if (!process.env.PRODIGI_API_KEY) {
+    return respond(500, {
+      error: "Prodigi API key is missing"
+    });
+  }
+
+  let sessionId;
+
+  try {
+    const payload = JSON.parse(event.body || "{}");
+    sessionId = payload.sessionId;
+  } catch (_) {
+    return respond(400, {
+      error: "Invalid JSON body"
+    });
+  }
 
   if (
     typeof sessionId !== "string" ||
@@ -152,11 +233,11 @@ exports.handler = async function(event) {
     connectLambda(event);
 
     const store = getStore(STORE_NAME);
+    const orderKey = `order-${sessionId}`;
 
-    const order = await store.get(
-      `order-${sessionId}`,
-      { type: "json" }
-    );
+    const order = await store.get(orderKey, {
+      type: "json"
+    });
 
     if (!order) {
       return respond(404, {
@@ -164,104 +245,149 @@ exports.handler = async function(event) {
       });
     }
 
-    const validated = validateOrder(
+    // Do not resubmit orders already recorded
+    // as successfully fulfilled.
+    if (
+      order.fulfillment?.status === "submitted" &&
+      order.fulfillment?.prodigiOrderId
+    ) {
+      return respond(200, {
+        success: true,
+        alreadySubmitted: true,
+        sessionId,
+        prodigiOrderId:
+          order.fulfillment.prodigiOrderId,
+        fulfillmentStatus: "submitted"
+      });
+    }
+
+    const prodigiOrder = buildProdigiOrder(
       order,
       sessionId
     );
 
-    const shipping = order.shipping;
-
-    // Prepare the recipient information.
-    // Omit line2 when absent.
-    const recipient = {
-      name: shipping.name,
-      email: shipping.email || undefined,
-      phone: shipping.phone || undefined,
-      address: {
-        line1: validated.address.line1,
-        city: validated.address.city,
-        state: validated.address.state,
-        postalCode: validated.address.postal_code,
-        countryCode: validated.address.country
-      }
-    };
-
-    if (validated.address.line2?.trim()) {
-      recipient.address.line2 =
-        validated.address.line2.trim();
-    }
-
-    // Prepare print specifications.
-    const printItems = validated.items.map(
-      item => ({
-        imageId: item.id,
-        sku: PRODUCTS[item.size],
-        copies: item.qty,
-        finish: item.finish,
-        imageUrl: item.url
-      })
-    );
-
-    // This is a preview of the information
-    // needed for the Prodigi order.
-    // No Prodigi API request is made.
-    const prepared = {
-      environment: "sandbox",
-      idempotencyKey: sessionId,
-      shippingMethod: "Budget",
-      recipient,
-      items: printItems
-    };
-
     console.log(
-      "Prodigi dry run validated:",
+      "[Prodigi Fulfillment] Submitting:",
       {
         sessionId,
-        itemCount: printItems.length,
-        totalPrints: validated.totalPrints
+        itemCount: prodigiOrder.items.length,
+        totalPrints: prodigiOrder.items.reduce(
+          (sum, item) => sum + item.copies,
+          0
+        )
       }
     );
 
-    // Return a privacy-safe summary.
-    // Do not expose customer details or URLs.
-    return respond(200, {
-      success: true,
-      dryRun: true,
-      readyForProdigi: true,
-      sessionId,
-      idempotencyKey: sessionId,
-      shippingMethod: prepared.shippingMethod,
-      recipient: {
-        hasName: !!recipient.name,
-        hasEmail: !!recipient.email,
-        hasAddressLine1: !!recipient.address.line1,
-        hasAddressLine2: !!recipient.address.line2,
-        hasCity: !!recipient.address.city,
-        hasState: !!recipient.address.state,
-        hasPostalCode: !!recipient.address.postalCode,
-        countryCode: recipient.address.countryCode
+    const response = await fetch(PRODIGI_API, {
+      method: "POST",
+      headers: {
+        "X-API-Key": process.env.PRODIGI_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
       },
-      items: printItems.map(item => ({
-        imageId: item.imageId,
-        sku: item.sku,
-        copies: item.copies,
-        finish: item.finish,
-        hasImageUrl: !!item.imageUrl
-      })),
-      totalPrints: validated.totalPrints,
-      fulfillmentStatus:
-        order.fulfillment?.status || null
+      body: JSON.stringify(prodigiOrder)
     });
+
+    const rawResponse = await response.text();
+
+    let result;
+
+    try {
+      result = JSON.parse(rawResponse);
+    } catch (_) {
+      result = {};
+    }
+
+    const outcome = result.outcome || null;
+
+    const prodigiOrderId =
+      result.order?.id ||
+      result.id ||
+      null;
+
+    const accepted =
+      response.ok &&
+      (
+        outcome === "Created" ||
+        outcome === "AlreadyExists" ||
+        outcome === "CreatedWithIssues"
+      ) &&
+      !!prodigiOrderId;
+
+    const now = new Date().toISOString();
+
+    const fulfillment = {
+      ...order.fulfillment,
+      provider: "prodigi",
+      attempts:
+        (order.fulfillment?.attempts || 0) + 1,
+      lastAttemptAt: now,
+      lastOutcome: outcome
+    };
+
+    if (accepted) {
+      fulfillment.status =
+        outcome === "CreatedWithIssues"
+          ? "needs_review"
+          : "submitted";
+
+      fulfillment.prodigiOrderId =
+        prodigiOrderId;
+
+      fulfillment.lastError = null;
+      fulfillment.submittedAt =
+        order.fulfillment?.submittedAt || now;
+
+    } else {
+      fulfillment.status = "failed";
+      fulfillment.lastError =
+        `Prodigi HTTP ${response.status}; outcome: ${
+          outcome || "unknown"
+        }`;
+    }
+
+    await store.setJSON(orderKey, {
+      ...order,
+      fulfillment,
+      updatedAt: now
+    });
+
+    console.log(
+      "[Prodigi Fulfillment] Result:",
+      {
+        sessionId,
+        prodigiStatus: response.status,
+        outcome,
+        prodigiOrderId,
+        fulfillmentStatus: fulfillment.status
+      }
+    );
+
+    return respond(
+      accepted ? 200 : 502,
+      {
+        success: accepted,
+        sessionId,
+        prodigiStatus: response.status,
+        outcome,
+        prodigiOrderId,
+        fulfillmentStatus: fulfillment.status,
+        totalPrints: prodigiOrder.items.reduce(
+          (sum, item) => sum + item.copies,
+          0
+        )
+      }
+    );
 
   } catch (error) {
     console.error(
-      "Prodigi preparation error:",
+      "[Prodigi Fulfillment] Error:",
       error.message
     );
 
-    return respond(422, {
+    return respond(500, {
       success: false,
-      error: error.message
+      error: "Prodigi fulfillment failed"
     });
   }
 };
