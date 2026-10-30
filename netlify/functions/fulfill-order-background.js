@@ -10,6 +10,10 @@ const {
 const ORDER_STORE = "print-commerce-orders";
 const IMAGE_STORE = "print-commerce-images";
 
+// NEW: Separate store for execution diagnostics.
+// This never modifies the actual order record.
+const DIAGNOSTIC_STORE = "print-commerce-diagnostics";
+
 function safeEqual(a, b) {
   if (
     typeof a !== "string" ||
@@ -53,6 +57,103 @@ function validSessionId(value) {
     typeof value === "string" &&
     /^cs_test_[A-Za-z0-9]+$/.test(value)
   );
+}
+
+// NEW: Save a timestamped diagnostic checkpoint.
+//
+// Diagnostics live in their own Netlify Blobs store,
+// separate from payment and fulfillment records.
+//
+// Never store tokens, signed image URLs, or
+// customer information in these records.
+async function saveCheckpoint(
+  sessionId,
+  stage,
+  details = {}
+) {
+  const diagnostics = getStore(
+    DIAGNOSTIC_STORE
+  );
+
+  const key = `worker/${sessionId}`;
+
+  const previous = await diagnostics.get(
+    key,
+    { type: "json" }
+  );
+
+  const history = Array.isArray(
+    previous?.history
+  )
+    ? previous.history.slice(-29)
+    : [];
+
+  const entry = {
+    stage,
+    timestamp: new Date().toISOString(),
+    ...details
+  };
+
+  history.push(entry);
+
+  await diagnostics.setJSON(key, {
+    sessionId,
+    stage,
+    updatedAt: entry.timestamp,
+    history
+  });
+
+  console.log(
+    "[Fulfillment Worker] Checkpoint",
+    {
+      sessionId,
+      stage
+    }
+  );
+}
+
+// NEW: Record diagnostics without changing the
+// original fulfillment flow if diagnostic storage
+// temporarily fails.
+async function recordCheckpoint(
+  sessionId,
+  stage,
+  details = {}
+) {
+  try {
+    await saveCheckpoint(
+      sessionId,
+      stage,
+      details
+    );
+  } catch (error) {
+    console.error(
+      "[Fulfillment Worker] Diagnostic write failed",
+      {
+        sessionId,
+        stage,
+        error: error.message
+      }
+    );
+  }
+}
+
+// NEW: Keep diagnostic errors concise and avoid
+// storing URLs, tokens, or customer details.
+function safeDiagnosticError(error) {
+  const message = String(
+    error?.message || "Unknown error"
+  );
+
+  if (
+    message.includes("http") ||
+    message.includes("token") ||
+    message.includes("?")
+  ) {
+    return "Request or configuration error";
+  }
+
+  return message.slice(0, 180);
 }
 
 async function callFunction(name, sessionId) {
@@ -261,6 +362,14 @@ exports.handler = async function(event) {
 
   connectLambda(event);
 
+  // NEW: First persistent checkpoint.
+  // Confirms the request passed authentication
+  // and contained a valid test session ID.
+  await recordCheckpoint(
+    sessionId,
+    "authenticated"
+  );
+
   const orders = getStore(ORDER_STORE);
 
   const order = await orders.get(
@@ -279,8 +388,22 @@ exports.handler = async function(event) {
       "[Fulfillment Worker] Valid paid order not found",
       { sessionId }
     );
+
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "order_not_found_or_unpaid"
+    );
+
     return;
   }
+
+  // NEW: Confirms the worker can read the
+  // paid order saved by Stripe.
+  await recordCheckpoint(
+    sessionId,
+    "paid_order_verified"
+  );
 
   const fulfillment = order.fulfillment || {};
 
@@ -300,6 +423,19 @@ exports.handler = async function(event) {
           fulfillment.prodigiOrderId || null
       }
     );
+
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "skipped_existing_submission",
+      {
+        fulfillmentStatus:
+          fulfillment.status || null,
+        prodigiOrderId:
+          fulfillment.prodigiOrderId || null
+      }
+    );
+
     return;
   }
 
@@ -308,10 +444,22 @@ exports.handler = async function(event) {
     { sessionId }
   );
 
+  // NEW
+  await recordCheckpoint(
+    sessionId,
+    "preparing_images"
+  );
+
   try {
     await callFunction(
       "prepare-images",
       sessionId
+    );
+
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "images_prepared"
     );
 
     const verifiedCount =
@@ -327,6 +475,15 @@ exports.handler = async function(event) {
         verifiedCount
       }
     );
+
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "images_verified",
+      {
+        verifiedCount
+      }
+    );
   } catch (error) {
     console.error(
       "[Fulfillment Worker] Image preparation or verification failed",
@@ -336,13 +493,30 @@ exports.handler = async function(event) {
       }
     );
 
-    // Do not submit an incomplete order.
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "image_preparation_failed",
+      {
+        error: safeDiagnosticError(error),
+        statusCode:
+          error.statusCode || null
+      }
+    );
+
+    // Original behavior: stop incomplete orders.
     throw error;
   }
 
   console.log(
     "[Fulfillment Worker] Submitting to Prodigi",
     { sessionId }
+  );
+
+  // NEW
+  await recordCheckpoint(
+    sessionId,
+    "submitting_to_prodigi"
   );
 
   try {
@@ -363,6 +537,20 @@ exports.handler = async function(event) {
           result.alreadySubmitted || false
       }
     );
+
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "submitted",
+      {
+        prodigiOrderId:
+          result.prodigiOrderId || null,
+        fulfillmentStatus:
+          result.fulfillmentStatus || null,
+        alreadySubmitted:
+          result.alreadySubmitted || false
+      }
+    );
   } catch (error) {
     console.error(
       "[Fulfillment Worker] Prodigi submission needs attention",
@@ -374,8 +562,21 @@ exports.handler = async function(event) {
       }
     );
 
-    // Never blindly retry an uncertain
-    // Prodigi submission.
+    // NEW
+    await recordCheckpoint(
+      sessionId,
+      "prodigi_submission_failed",
+      {
+        error: safeDiagnosticError(error),
+        statusCode:
+          error.statusCode || null,
+        fulfillmentStatus:
+          error.fulfillmentStatus || null
+      }
+    );
+
+    // Original behavior: never blindly retry
+    // an uncertain Prodigi submission.
     throw error;
   }
 };
