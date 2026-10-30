@@ -316,17 +316,14 @@ exports.handler = async function (event) {
     );
   });
 
-  params.set(
-    "success_url",
-    SITE_URL +
-      "/?checkout=success&session_id=" +
-      "{CHECKOUT_SESSION_ID}"
-  );
+  
+params.set(
+  "success_url",
+  SITE_URL.replace(/\/+$/, "") +
+    "/success.html?session_id=" +
+    "{CHECKOUT_SESSION_ID}"
+);
 
-  params.set(
-    "cancel_url",
-    SITE_URL + "/?checkout=cancelled"
-  );
 
   try {
     const response = await fetch(
