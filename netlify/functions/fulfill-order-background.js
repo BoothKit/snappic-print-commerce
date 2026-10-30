@@ -8,6 +8,7 @@ const {
 } = require("@netlify/blobs");
 
 const ORDER_STORE = "print-commerce-orders";
+const IMAGE_STORE = "print-commerce-images";
 
 function safeEqual(a, b) {
   if (
@@ -47,6 +48,13 @@ function getSiteURL() {
   return url.origin;
 }
 
+function validSessionId(value) {
+  return (
+    typeof value === "string" &&
+    /^cs_test_[A-Za-z0-9]+$/.test(value)
+  );
+}
+
 async function callFunction(name, sessionId) {
   const url =
     `${getSiteURL()}/.netlify/functions/${name}`;
@@ -68,7 +76,10 @@ async function callFunction(name, sessionId) {
     result = await response.json();
   } catch (_) {}
 
-  if (!response.ok || result.success !== true) {
+  if (
+    !response.ok ||
+    result.success !== true
+  ) {
     const error = new Error(
       `${name} failed with HTTP ${response.status}`
     );
@@ -81,6 +92,120 @@ async function callFunction(name, sessionId) {
   }
 
   return result;
+}
+
+async function verifyHostedImages(
+  sessionId,
+  manifestItems
+) {
+  if (
+    !Array.isArray(manifestItems) ||
+    manifestItems.length < 1 ||
+    manifestItems.length > 2
+  ) {
+    throw new Error("Invalid order image manifest");
+  }
+
+  const images = getStore(IMAGE_STORE);
+  const seen = new Set();
+
+  for (const item of manifestItems) {
+    if (
+      !item ||
+      !["main", "original"].includes(item.id) ||
+      seen.has(item.id)
+    ) {
+      throw new Error("Invalid manifest image ID");
+    }
+
+    seen.add(item.id);
+
+    const delivery = await images.get(
+      `delivery/${sessionId}/${item.id}`,
+      { type: "json" }
+    );
+
+    if (
+      !delivery ||
+      typeof delivery.deliveryURL !== "string"
+    ) {
+      throw new Error(
+        `Hosted image not prepared: ${item.id}`
+      );
+    }
+
+    let url;
+
+    try {
+      url = new URL(delivery.deliveryURL);
+    } catch (_) {
+      throw new Error(
+        `Invalid delivery URL: ${item.id}`
+      );
+    }
+
+    if (
+      url.origin !== getSiteURL() ||
+      url.pathname !==
+        "/.netlify/functions/serve-image" ||
+      url.searchParams.get("sessionId") !==
+        sessionId ||
+      url.searchParams.get("imageId") !==
+        item.id ||
+      !/^[a-f0-9]{64}$/.test(
+        url.searchParams.get("token") || ""
+      )
+    ) {
+      throw new Error(
+        `Invalid hosted image delivery record: ${item.id}`
+      );
+    }
+
+    const response = await fetch(
+      url.toString(),
+      {
+        method: "GET",
+        signal: AbortSignal.timeout(15000)
+      }
+    );
+
+    if (
+      !response.ok ||
+      !(
+        response.headers.get("content-type") || ""
+      ).toLowerCase().startsWith("image/jpeg")
+    ) {
+      throw new Error(
+        `Hosted image unavailable: ${item.id} (HTTP ${response.status})`
+      );
+    }
+
+    const bytes = Buffer.from(
+      await response.arrayBuffer()
+    );
+
+    if (
+      bytes.length < 4 ||
+      bytes[0] !== 0xff ||
+      bytes[1] !== 0xd8 ||
+      bytes[2] !== 0xff
+    ) {
+      throw new Error(
+        `Invalid hosted JPEG: ${item.id}`
+      );
+    }
+
+    console.log(
+      "[Fulfillment Worker] Verified hosted image",
+      {
+        sessionId,
+        imageId: item.id,
+        bytes: bytes.length
+      }
+    );
+  }
+
+  return seen.size;
 }
 
 exports.handler = async function(event) {
@@ -127,10 +252,7 @@ exports.handler = async function(event) {
     return;
   }
 
-  if (
-    typeof sessionId !== "string" ||
-    !/^cs_test_[A-Za-z0-9]+$/.test(sessionId)
-  ) {
+  if (!validSessionId(sessionId)) {
     console.error(
       "[Fulfillment Worker] Invalid test session"
     );
@@ -139,16 +261,17 @@ exports.handler = async function(event) {
 
   connectLambda(event);
 
-  const store = getStore(ORDER_STORE);
+  const orders = getStore(ORDER_STORE);
 
-  const order = await store.get(
+  const order = await orders.get(
     `order-${sessionId}`,
     { type: "json" }
   );
 
   if (
     !order ||
-    order.application !== "snappic-print-commerce" ||
+    order.application !==
+      "snappic-print-commerce" ||
     order.sessionId !== sessionId ||
     order.paymentStatus !== "paid"
   ) {
@@ -163,15 +286,18 @@ exports.handler = async function(event) {
 
   if (
     fulfillment.prodigiOrderId ||
-    ["submitting", "needs_review"].includes(
-      fulfillment.status
-    )
+    [
+      "submitting",
+      "needs_review"
+    ].includes(fulfillment.status)
   ) {
     console.log(
       "[Fulfillment Worker] Skipping existing submission",
       {
         sessionId,
-        status: fulfillment.status
+        status: fulfillment.status,
+        prodigiOrderId:
+          fulfillment.prodigiOrderId || null
       }
     );
     return;
@@ -188,18 +314,29 @@ exports.handler = async function(event) {
       sessionId
     );
 
+    const verifiedCount =
+      await verifyHostedImages(
+        sessionId,
+        order.manifest?.items
+      );
+
     console.log(
-      "[Fulfillment Worker] Images ready",
-      { sessionId }
+      "[Fulfillment Worker] All images verified",
+      {
+        sessionId,
+        verifiedCount
+      }
     );
   } catch (error) {
     console.error(
-      "[Fulfillment Worker] Image preparation failed",
+      "[Fulfillment Worker] Image preparation or verification failed",
       {
         sessionId,
         error: error.message
       }
     );
+
+    // Do not submit an incomplete order.
     throw error;
   }
 
@@ -226,7 +363,6 @@ exports.handler = async function(event) {
           result.alreadySubmitted || false
       }
     );
-
   } catch (error) {
     console.error(
       "[Fulfillment Worker] Prodigi submission needs attention",
@@ -238,7 +374,7 @@ exports.handler = async function(event) {
       }
     );
 
-    // Do not automatically retry an uncertain
+    // Never blindly retry an uncertain
     // Prodigi submission.
     throw error;
   }
