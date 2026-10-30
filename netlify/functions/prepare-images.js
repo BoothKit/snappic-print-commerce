@@ -92,9 +92,10 @@ function validateRedirectURL(value) {
   }
 
   const allowedHosts = [
-    "app.snappic.com",
-    "photobooth-images.s3.amazonaws.com"
-  ];
+  "app.snappic.com",
+  "photobooth-images.myboothpic.co",
+  "photobooth-images.s3.amazonaws.com"
+];
 
   if (!allowedHosts.includes(url.hostname)) {
   console.error("[Image Redirect Validation]", {
