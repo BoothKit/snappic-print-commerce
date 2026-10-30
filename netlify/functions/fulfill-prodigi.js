@@ -10,8 +10,28 @@ const {
 const PRODIGI_API =
   "https://api.sandbox.prodigi.com/v4.0/orders";
 
-const SITE_URL =
-  "https://snappic-print-commerce.netlify.app";
+function getSiteURL() {
+  const configured = process.env.URL;
+
+  if (!configured) {
+    throw new Error("Netlify URL is not configured");
+  }
+
+  const url = new URL(configured);
+
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== "/"
+  ) {
+    throw new Error("Invalid Netlify URL");
+  }
+
+  return url.origin;
+}
 
 const ORDER_STORE = "print-commerce-orders";
 const IMAGE_STORE = "print-commerce-images";
@@ -156,11 +176,12 @@ async function getHostedImages(sessionId, items) {
     }
 
     const url = new URL(delivery.deliveryURL);
+
     const expectedPrefix =
       "/.netlify/functions/serve-image";
 
     if (
-      url.origin !== SITE_URL ||
+      url.origin !== getSiteURL() ||
       url.pathname !== expectedPrefix ||
       url.searchParams.get("sessionId") !== sessionId ||
       url.searchParams.get("imageId") !== item.id ||
@@ -173,8 +194,7 @@ async function getHostedImages(sessionId, items) {
       );
     }
 
-    // Check that our public delivery endpoint
-    // can actually return the JPEG.
+    // Verify that Prodigi can retrieve the JPEG.
     const response = await fetch(url.toString(), {
       method: "GET",
       signal: AbortSignal.timeout(15000)
@@ -297,14 +317,17 @@ exports.handler = async function(event) {
   let sessionId;
 
   try {
-    const payload = JSON.parse(event.body || "{}");
-    sessionId = payload.sessionId;
+    sessionId = JSON.parse(
+      event.body || "{}"
+    ).sessionId;
   } catch (_) {
     return respond(400, {
       error: "Invalid JSON body"
     });
   }
 
+  // Test mode only. Do not enable live
+  // payments in this step.
   if (
     typeof sessionId !== "string" ||
     !/^cs_test_[a-zA-Z0-9]+$/.test(sessionId)
@@ -330,23 +353,41 @@ exports.handler = async function(event) {
       });
     }
 
-    // Never resubmit an order that was already
-    // accepted by Prodigi.
-    if (
-      order.fulfillment?.prodigiOrderId &&
-      [
-        "submitted",
-        "needs_review"
-      ].includes(order.fulfillment?.status)
-    ) {
+    const fulfillmentStatus =
+      order.fulfillment?.status;
+
+    const prodigiOrderId =
+      order.fulfillment?.prodigiOrderId || null;
+
+    // An existing Prodigi ID means we should
+    // never submit this order again.
+    if (prodigiOrderId) {
       return respond(200, {
         success: true,
         alreadySubmitted: true,
         sessionId,
-        prodigiOrderId:
-          order.fulfillment.prodigiOrderId,
-        fulfillmentStatus:
-          order.fulfillment.status
+        prodigiOrderId,
+        fulfillmentStatus
+      });
+    }
+
+    // An uncertain previous attempt must be
+    // reconciled before retrying.
+    //
+    // Blobs are not an atomic lock.
+    // Prodigi's idempotency key remains the
+    // final duplicate-submission safeguard.
+    if (
+      ["submitting", "needs_review"].includes(
+        fulfillmentStatus
+      )
+    ) {
+      return respond(409, {
+        success: false,
+        sessionId,
+        fulfillmentStatus,
+        error:
+          "Previous submission may have reached Prodigi. Reconcile before retrying."
       });
     }
 
@@ -355,8 +396,6 @@ exports.handler = async function(event) {
       sessionId
     );
 
-    // Hosted images are mandatory.
-    // Never fall back to original Snappic URLs.
     const hostedURLs = await getHostedImages(
       sessionId,
       validated.items
@@ -369,98 +408,161 @@ exports.handler = async function(event) {
       hostedURLs
     );
 
-    console.log(
-      "[Prodigi Fulfillment] Submitting hosted images:",
-      {
-        sessionId,
-        imageCount: hostedURLs.size,
-        totalPrints: validated.totalPrints
-      }
-    );
+    const now = new Date().toISOString();
 
-    const response = await fetch(PRODIGI_API, {
-      method: "POST",
-      headers: {
-        "X-API-Key": process.env.PRODIGI_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      body: JSON.stringify(prodigiOrder),
-      signal: AbortSignal.timeout(20000)
+    const attempting = {
+      ...order.fulfillment,
+      provider: "prodigi",
+      status: "submitting",
+      attempts:
+        (order.fulfillment?.attempts || 0) + 1,
+      lastAttemptAt: now,
+      lastError: null,
+      idempotencyKey: sessionId
+    };
+
+    // Record the attempt BEFORE contacting Prodigi.
+    await store.setJSON(orderKey, {
+      ...order,
+      fulfillment: attempting,
+      updatedAt: now
     });
 
-    const rawResponse = await response.text();
+    let response;
+    let rawResponse;
 
-    let result;
+    try {
+      response = await fetch(PRODIGI_API, {
+        method: "POST",
+        headers: {
+          "X-API-Key":
+            process.env.PRODIGI_API_KEY,
+          "Content-Type":
+            "application/json",
+          "Accept":
+            "application/json"
+        },
+        body: JSON.stringify(prodigiOrder),
+        signal: AbortSignal.timeout(20000)
+      });
+
+      rawResponse = await response.text();
+
+    } catch (error) {
+      // A timeout does not prove Prodigi
+      // rejected the order.
+      const reviewedAt =
+        new Date().toISOString();
+
+      await store.setJSON(orderKey, {
+        ...order,
+        fulfillment: {
+          ...attempting,
+          status: "needs_review",
+          lastError:
+            `Prodigi response unknown: ${error.message}`
+        },
+        updatedAt: reviewedAt
+      });
+
+      console.error(
+        "[Prodigi] Uncertain submission",
+        {
+          sessionId,
+          error: error.message
+        }
+      );
+
+      return respond(502, {
+        success: false,
+        sessionId,
+        fulfillmentStatus: "needs_review",
+        error:
+          "Prodigi submission outcome unknown; reconcile before retrying"
+      });
+    }
+
+    let result = {};
 
     try {
       result = JSON.parse(rawResponse);
-    } catch (_) {
-      result = {};
-    }
+    } catch (_) {}
 
-    const outcome = result.outcome || null;
+    const outcome =
+      typeof result.outcome === "string"
+        ? result.outcome
+        : null;
 
-    const prodigiOrderId =
+    const normalized =
+      (outcome || "").toLowerCase();
+
+    const returnedId =
       result.order?.id ||
       result.id ||
       null;
 
+    const acceptedOutcomes = [
+      "created",
+      "alreadyexists",
+      "createdwithissues",
+      "onhold"
+    ];
+
     const accepted =
       response.ok &&
-      [
-        "Created",
-        "AlreadyExists",
-        "CreatedWithIssues"
-      ].includes(outcome) &&
-      !!prodigiOrderId;
+      acceptedOutcomes.includes(normalized) &&
+      !!returnedId;
 
-    const now = new Date().toISOString();
+    const reviewRequired = [
+      "createdwithissues",
+      "onhold"
+    ].includes(normalized);
 
-    const fulfillment = {
-      ...order.fulfillment,
-      provider: "prodigi",
-      attempts:
-        (order.fulfillment?.attempts || 0) + 1,
-      lastAttemptAt: now,
-      lastOutcome: outcome
+    const finishedAt =
+      new Date().toISOString();
+
+    const updatedFulfillment = {
+      ...attempting,
+      lastOutcome: outcome,
+      lastHttpStatus: response.status,
+
+      status: accepted
+        ? (
+            reviewRequired
+              ? "needs_review"
+              : "submitted"
+          )
+        : "needs_review",
+
+      prodigiOrderId:
+        accepted ? returnedId : null,
+
+      submittedAt:
+        accepted ? finishedAt : null,
+
+      lastError:
+        accepted
+          ? null
+          : `Prodigi HTTP ${response.status}; outcome: ${
+              outcome || "unknown"
+            }. Reconcile before retrying.`
     };
-
-    if (accepted) {
-      fulfillment.status =
-        outcome === "CreatedWithIssues"
-          ? "needs_review"
-          : "submitted";
-
-      fulfillment.prodigiOrderId =
-        prodigiOrderId;
-
-      fulfillment.lastError = null;
-      fulfillment.submittedAt =
-        order.fulfillment?.submittedAt || now;
-
-    } else {
-      fulfillment.status = "failed";
-      fulfillment.lastError =
-        `Prodigi HTTP ${response.status}; outcome: ${
-          outcome || "unknown"
-        }`;
-    }
 
     await store.setJSON(orderKey, {
       ...order,
-      fulfillment,
-      updatedAt: now
+      fulfillment: updatedFulfillment,
+      updatedAt: finishedAt
     });
 
     console.log(
-      "[Prodigi Fulfillment] Result:",
+      "[Prodigi] Submission result",
       {
         sessionId,
-        prodigiStatus: response.status,
+        httpStatus: response.status,
         outcome,
-        prodigiOrderId,
-        fulfillmentStatus: fulfillment.status
+        prodigiOrderId: returnedId,
+        fulfillmentStatus:
+          updatedFulfillment.status
       }
     );
 
@@ -471,9 +573,12 @@ exports.handler = async function(event) {
         sessionId,
         prodigiStatus: response.status,
         outcome,
-        prodigiOrderId,
-        fulfillmentStatus: fulfillment.status,
-        totalPrints: validated.totalPrints
+        prodigiOrderId:
+          accepted ? returnedId : null,
+        fulfillmentStatus:
+          updatedFulfillment.status,
+        totalPrints:
+          validated.totalPrints
       }
     );
 
