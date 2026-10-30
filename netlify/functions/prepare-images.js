@@ -31,7 +31,9 @@ function authorized(event) {
     event.headers?.["x-inspect-token"] ||
     event.headers?.["X-Inspect-Token"];
 
-  if (!expected || !supplied) return false;
+  if (!expected || !supplied) {
+    return false;
+  }
 
   const a = Buffer.from(expected);
   const b = Buffer.from(supplied);
@@ -49,6 +51,29 @@ function isValidSessionId(value) {
   );
 }
 
+function getSiteURL() {
+  const value =
+    process.env.URL ||
+    "https://snappic-print-commerce.netlify.app";
+
+  const url = new URL(value);
+
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== "/"
+  ) {
+    throw new Error(
+      "Invalid Netlify site URL configuration"
+    );
+  }
+
+  return url.origin;
+}
+
 function validateSourceURL(value) {
   if (typeof value !== "string") {
     throw new Error("Missing image URL");
@@ -56,24 +81,31 @@ function validateSourceURL(value) {
 
   const url = new URL(value);
 
+  const validPath =
+    /^\/media\/download\/photo\/[A-Za-z0-9_-]+\/?$/.test(
+      url.pathname
+    ) ||
+    /^\/photo\/still\/[A-Za-z0-9_-]+\.jpe?g$/i.test(
+      url.pathname
+    );
+
   if (
     url.protocol !== "https:" ||
     url.hostname !== "app.snappic.com" ||
     url.port ||
     url.username ||
     url.password ||
-    !(
-  /^\/media\/download\/photo\/[A-Za-z0-9_-]+\/?$/.test(url.pathname) ||
-  /^\/photo\/still\/[A-Za-z0-9_-]+\.jpe?g$/i.test(url.pathname)
-)
+    !validPath
   ) {
     console.error("[Image URL Validation]", {
-  hostname: url.hostname,
-  pathname: url.pathname,
-  protocol: url.protocol
-});
+      hostname: url.hostname,
+      pathname: url.pathname,
+      protocol: url.protocol
+    });
 
-throw new Error("Unsupported Snappic image URL");
+    throw new Error(
+      "Unsupported Snappic image URL"
+    );
   }
 
   return url;
@@ -88,25 +120,27 @@ function validateRedirectURL(value) {
     url.password ||
     url.port
   ) {
-    throw new Error("Unsafe image redirect");
+    throw new Error(
+      "Unsafe image redirect"
+    );
   }
 
   const allowedHosts = [
-  "app.snappic.com",
-  "photobooth-images.myboothpic.co",
-  "photobooth-images.s3.amazonaws.com"
-];
+    "app.snappic.com",
+    "photobooth-images.myboothpic.co",
+    "photobooth-images.s3.amazonaws.com"
+  ];
 
   if (!allowedHosts.includes(url.hostname)) {
-  console.error("[Image Redirect Validation]", {
-    hostname: url.hostname,
-    protocol: url.protocol
-  });
+    console.error("[Image Redirect Validation]", {
+      hostname: url.hostname,
+      protocol: url.protocol
+    });
 
-  throw new Error(
-    "Image redirected to an unsupported host"
-  );
-}
+    throw new Error(
+      "Image redirected to an unsupported host"
+    );
+  }
 
   return url;
 }
@@ -140,7 +174,10 @@ async function downloadImage(sourceURL) {
       }
 
       currentURL = validateRedirectURL(
-        new URL(location, currentURL).toString()
+        new URL(
+          location,
+          currentURL
+        ).toString()
       );
 
       continue;
@@ -157,13 +194,18 @@ async function downloadImage(sourceURL) {
     );
 
     if (declaredLength > MAX_IMAGE_BYTES) {
-      throw new Error("Image exceeds 15 MB");
+      throw new Error(
+        "Image exceeds 15 MB"
+      );
     }
 
-    const reader = response.body?.getReader();
+    const reader =
+      response.body?.getReader();
 
     if (!reader) {
-      throw new Error("Missing image response body");
+      throw new Error(
+        "Missing image response body"
+      );
     }
 
     const chunks = [];
@@ -171,26 +213,34 @@ async function downloadImage(sourceURL) {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } =
+          await reader.read();
 
-        if (done) break;
+        if (done) {
+          break;
+        }
 
         totalBytes += value.byteLength;
 
         if (totalBytes > MAX_IMAGE_BYTES) {
           await reader.cancel();
-          throw new Error("Image exceeds 15 MB");
+
+          throw new Error(
+            "Image exceeds 15 MB"
+          );
         }
 
-        chunks.push(Buffer.from(value));
+        chunks.push(
+          Buffer.from(value)
+        );
       }
     } finally {
       reader.releaseLock();
     }
 
-    const buffer = Buffer.concat(chunks);
+    const buffer =
+      Buffer.concat(chunks);
 
-    // JPEG starts with FF D8 FF.
     const isJPEG =
       buffer.length > 4 &&
       buffer[0] === 0xff &&
@@ -203,7 +253,6 @@ async function downloadImage(sourceURL) {
       );
     }
 
-    // JPEG normally ends with FF D9.
     const hasJPEGEnd =
       buffer[buffer.length - 2] === 0xff &&
       buffer[buffer.length - 1] === 0xd9;
@@ -217,7 +266,121 @@ async function downloadImage(sourceURL) {
     return buffer;
   }
 
-  throw new Error("Too many image redirects");
+  throw new Error(
+    "Too many image redirects"
+  );
+}
+
+function getDeliveryKey(sessionId, imageId) {
+  return `delivery/${sessionId}/${imageId}`;
+}
+
+function getImageKey(sessionId, imageId) {
+  return `images/${sessionId}/${imageId}.jpg`;
+}
+
+function createDeliveryURL(
+  siteURL,
+  sessionId,
+  imageId,
+  accessToken
+) {
+  const url = new URL(
+    "/.netlify/functions/serve-image",
+    siteURL
+  );
+
+  url.searchParams.set(
+    "sessionId",
+    sessionId
+  );
+
+  url.searchParams.set(
+    "imageId",
+    imageId
+  );
+
+  url.searchParams.set(
+    "token",
+    accessToken
+  );
+
+  return url.toString();
+}
+
+function isReusableDelivery(
+  delivery,
+  storedImage,
+  sessionId,
+  imageId,
+  imageKey,
+  siteURL
+) {
+  if (
+    !delivery?.deliveryURL ||
+    delivery.imageKey !== imageKey ||
+    !storedImage?.data ||
+    !storedImage?.metadata
+  ) {
+    return false;
+  }
+
+  try {
+    const url = new URL(
+      delivery.deliveryURL
+    );
+
+    const token =
+      url.searchParams.get("token");
+
+    if (
+      url.origin !== siteURL ||
+      url.pathname !==
+        "/.netlify/functions/serve-image" ||
+      url.searchParams.get("sessionId") !==
+        sessionId ||
+      url.searchParams.get("imageId") !==
+        imageId ||
+      !/^[a-f0-9]{64}$/.test(token || "")
+    ) {
+      return false;
+    }
+
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const metadata =
+      storedImage.metadata;
+
+    if (
+      metadata.sessionId !== sessionId ||
+      metadata.imageId !== imageId ||
+      metadata.accessTokenHash !== tokenHash
+    ) {
+      return false;
+    }
+
+    const bytes =
+      Buffer.from(storedImage.data);
+
+    const isJPEG =
+      bytes.length > 4 &&
+      bytes[0] === 0xff &&
+      bytes[1] === 0xd8 &&
+      bytes[2] === 0xff;
+
+    const hasJPEGEnd =
+      bytes.length > 4 &&
+      bytes[bytes.length - 2] === 0xff &&
+      bytes[bytes.length - 1] === 0xd9;
+
+    return isJPEG && hasJPEGEnd;
+
+  } catch (_) {
+    return false;
+  }
 }
 
 exports.handler = async function(event) {
@@ -241,6 +404,7 @@ exports.handler = async function(event) {
     );
 
     sessionId = payload.sessionId;
+
   } catch (_) {
     return respond(400, {
       error: "Invalid JSON body"
@@ -256,8 +420,14 @@ exports.handler = async function(event) {
   try {
     connectLambda(event);
 
-    const orders = getStore(ORDER_STORE);
-    const images = getStore(IMAGE_STORE);
+    const orders =
+      getStore(ORDER_STORE);
+
+    const images =
+      getStore(IMAGE_STORE);
+
+    const siteURL =
+      getSiteURL();
 
     const order = await orders.get(
       `order-${sessionId}`,
@@ -276,7 +446,8 @@ exports.handler = async function(event) {
       });
     }
 
-    const items = order.manifest?.items;
+    const items =
+      order.manifest?.items;
 
     if (
       !Array.isArray(items) ||
@@ -288,64 +459,159 @@ exports.handler = async function(event) {
       });
     }
 
+    const seenIds = new Set();
     const results = [];
 
     for (const item of items) {
       if (
-        !["main", "original"].includes(item.id)
+        !item ||
+        !["main", "original"].includes(
+          item.id
+        ) ||
+        seenIds.has(item.id)
       ) {
         throw new Error(
-          "Unsupported photo selection"
+          "Invalid or duplicate photo selection"
         );
       }
 
-      const buffer = await downloadImage(
-        item.url
-      );
+      seenIds.add(item.id);
 
       const imageKey =
-  `images/${sessionId}/${item.id}.jpg`;
+        getImageKey(
+          sessionId,
+          item.id
+        );
 
-const accessToken = crypto.randomBytes(32).toString("hex");
+      const deliveryKey =
+        getDeliveryKey(
+          sessionId,
+          item.id
+        );
 
-const accessTokenHash = crypto
-  .createHash("sha256")
-  .update(accessToken)
-  .digest("hex");
+      // First, check whether the image has
+      // already been prepared successfully.
+      const existingDelivery =
+        await images.get(
+          deliveryKey,
+          { type: "json" }
+        );
 
-await images.set(imageKey, buffer, {
-  metadata: {
-    contentType: "image/jpeg",
-    sessionId,
-    imageId: item.id,
-    accessTokenHash,
-    uploadedAt: new Date().toISOString()
-  }
-});
+      const existingImage =
+        await images.getWithMetadata(
+          imageKey,
+          { type: "arrayBuffer" }
+        );
 
-const deliveryURL =
-  `https://snappic-print-commerce.netlify.app` +
-  `/.netlify/functions/serve-image` +
-  `?sessionId=${encodeURIComponent(sessionId)}` +
-  `&imageId=${encodeURIComponent(item.id)}` +
-  `&token=${accessToken}`;
+      if (
+        isReusableDelivery(
+          existingDelivery,
+          existingImage,
+          sessionId,
+          item.id,
+          imageKey,
+          siteURL
+        )
+      ) {
+        results.push({
+          imageId: item.id,
+          stored: true,
+          reused: true,
+          bytes:
+            existingImage.data.byteLength,
+          contentType: "image/jpeg",
+          deliveryURL:
+            existingDelivery.deliveryURL
+        });
 
-await images.setJSON(
-  `delivery/${sessionId}/${item.id}`,
-  {
-    deliveryURL,
-    imageKey,
-    createdAt: new Date().toISOString()
-  }
-);
+        console.log(
+          "[Image Preparation] Reused:",
+          {
+            sessionId,
+            imageId: item.id
+          }
+        );
+
+        continue;
+      }
+
+      // Never silently overwrite an image
+      // or delivery token that may already
+      // be in use by Prodigi.
+      if (
+        existingDelivery ||
+        existingImage
+      ) {
+        throw new Error(
+          `Existing image state requires review: ${item.id}`
+        );
+      }
+
+      // Image has not been prepared yet.
+      const buffer =
+        await downloadImage(
+          item.url
+        );
+
+      const accessToken = crypto
+        .randomBytes(32)
+        .toString("hex");
+
+      const accessTokenHash = crypto
+        .createHash("sha256")
+        .update(accessToken)
+        .digest("hex");
+
+      await images.set(
+        imageKey,
+        buffer,
+        {
+          metadata: {
+            contentType: "image/jpeg",
+            sessionId,
+            imageId: item.id,
+            accessTokenHash,
+            uploadedAt:
+              new Date().toISOString()
+          }
+        }
+      );
+
+      const deliveryURL =
+        createDeliveryURL(
+          siteURL,
+          sessionId,
+          item.id,
+          accessToken
+        );
+
+      await images.setJSON(
+        deliveryKey,
+        {
+          deliveryURL,
+          imageKey,
+          createdAt:
+            new Date().toISOString()
+        }
+      );
 
       results.push({
-  imageId: item.id,
-  stored: true,
-  bytes: buffer.length,
-  contentType: "image/jpeg",
-  deliveryURL
-});
+        imageId: item.id,
+        stored: true,
+        reused: false,
+        bytes: buffer.length,
+        contentType: "image/jpeg",
+        deliveryURL
+      });
+
+      console.log(
+        "[Image Preparation] Created:",
+        {
+          sessionId,
+          imageId: item.id,
+          bytes: buffer.length
+        }
+      );
     }
 
     return respond(200, {
