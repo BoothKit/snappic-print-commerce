@@ -385,9 +385,12 @@ exports.handler = async function(event) {
     try {
       // Use the original Netlify Blobs read format.
       order = await orders.get(
-        `order-${sessionId}`,
-        { type: "json" }
-      );
+  `order-${sessionId}`,
+  {
+    type: "json",
+    consistency: "strong"
+  }
+);
     } catch (error) {
       console.error(
         "[Fulfillment Worker] Order read failed",
