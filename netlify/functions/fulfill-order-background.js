@@ -370,40 +370,88 @@ exports.handler = async function(event) {
     "authenticated"
   );
 
+  
   const orders = getStore(ORDER_STORE);
 
   let order = null;
 
-for (let attempt = 1; attempt <= 5; attempt++) {
-  order = await orders.get(
-    `order-${sessionId}`,
-    { type: "json", consistency: "strong" }
-  );
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    await recordCheckpoint(
+      sessionId,
+      "reading_order",
+      { attempt }
+    );
 
-  const validOrder =
-    order?.application === "snappic-print-commerce" &&
-    order?.sessionId === sessionId &&
-    order?.paymentStatus === "paid";
+    try {
+      // Use the original Netlify Blobs read format.
+      order = await orders.get(
+        `order-${sessionId}`,
+        { type: "json" }
+      );
+    } catch (error) {
+      console.error(
+        "[Fulfillment Worker] Order read failed",
+        {
+          sessionId,
+          attempt,
+          error: error.message
+        }
+      );
 
-  if (validOrder) {
-    console.log(
-      "[Fulfillment Worker] Paid order found",
+      await recordCheckpoint(
+        sessionId,
+        "order_read_failed",
+        {
+          attempt,
+          error: safeDiagnosticError(error)
+        }
+      );
+
+      // Do not treat a storage error as
+      // proof that an order is missing.
+      throw error;
+    }
+
+    const validOrder =
+      order?.application === "snappic-print-commerce" &&
+      order?.sessionId === sessionId &&
+      order?.paymentStatus === "paid";
+
+    if (validOrder) {
+      console.log(
+        "[Fulfillment Worker] Paid order found",
+        { sessionId, attempt }
+      );
+
+      await recordCheckpoint(
+        sessionId,
+        "paid_order_verified",
+        { attempt }
+      );
+
+      break;
+    }
+
+    console.warn(
+      "[Fulfillment Worker] Paid order not visible yet",
       { sessionId, attempt }
     );
-    break;
-  }
 
-  console.warn(
-    "[Fulfillment Worker] Paid order not visible yet",
-    { sessionId, attempt }
-  );
-
-  if (attempt < 5) {
-    await new Promise(resolve =>
-      setTimeout(resolve, 2000)
+    await recordCheckpoint(
+      sessionId,
+      "order_not_visible",
+      {
+        attempt,
+        recordExists: !!order
+      }
     );
+
+    if (attempt < 5) {
+      await new Promise(resolve =>
+        setTimeout(resolve, 2000)
+      );
+    }
   }
-}
 
   if (
     !order ||
@@ -417,7 +465,6 @@ for (let attempt = 1; attempt <= 5; attempt++) {
       { sessionId }
     );
 
-    // NEW
     await recordCheckpoint(
       sessionId,
       "order_not_found_or_unpaid"
@@ -426,12 +473,6 @@ for (let attempt = 1; attempt <= 5; attempt++) {
     return;
   }
 
-  // NEW: Confirms the worker can read the
-  // paid order saved by Stripe.
-  await recordCheckpoint(
-    sessionId,
-    "paid_order_verified"
-  );
 
   const fulfillment = order.fulfillment || {};
 
