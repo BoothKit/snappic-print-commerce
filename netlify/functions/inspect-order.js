@@ -77,8 +77,9 @@ exports.handler = async function (event) {
       headers: HEADERS,
       body: JSON.stringify({
         success: true,
-        sessionId: record.sessionId,
-        paymentStatus: record.paymentStatus,
+application: record.application || null,
+sessionId: record.sessionId,
+paymentStatus: record.paymentStatus,
         amountTotal: record.amountTotal,
         currency: record.currency,
         shipping: {
