@@ -433,10 +433,16 @@ exports.handler = async function(event) {
     }
 
     console.warn(
-      "[Fulfillment Worker] Paid order not visible yet",
-      { sessionId, attempt }
-    );
-
+  "[Fulfillment Worker] Paid order not visible yet",
+  {
+    sessionId,
+    attempt,
+    recordExists: !!order,
+    application: order?.application || null,
+    sessionMatches: order?.sessionId === sessionId,
+    paymentStatus: order?.paymentStatus || null
+  }
+);
     await recordCheckpoint(
       sessionId,
       "order_not_visible",
