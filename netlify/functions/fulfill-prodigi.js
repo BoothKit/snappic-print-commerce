@@ -10,7 +10,11 @@ const {
 const PRODIGI_API =
   "https://api.sandbox.prodigi.com/v4.0/orders";
 
-const STORE_NAME = "print-commerce-orders";
+const SITE_URL =
+  "https://snappic-print-commerce.netlify.app";
+
+const ORDER_STORE = "print-commerce-orders";
+const IMAGE_STORE = "print-commerce-images";
 
 const PRODUCTS = {
   "4x6": "GLOBAL-PHO-4X6",
@@ -85,9 +89,19 @@ function validateOrder(order, sessionId) {
     throw new Error("Invalid print items");
   }
 
+  const seenIds = new Set();
   let totalPrints = 0;
 
   for (const item of items) {
+    if (
+      !["main", "original"].includes(item.id) ||
+      seenIds.has(item.id)
+    ) {
+      throw new Error("Invalid photo selection");
+    }
+
+    seenIds.add(item.id);
+
     if (!Object.hasOwn(PRODUCTS, item.size)) {
       throw new Error("Unsupported print size");
     }
@@ -96,7 +110,7 @@ function validateOrder(order, sessionId) {
       typeof item.url !== "string" ||
       !item.url.startsWith("https://")
     ) {
-      throw new Error("Invalid photo URL");
+      throw new Error("Invalid source photo URL");
     }
 
     if (
@@ -125,12 +139,85 @@ function validateOrder(order, sessionId) {
   };
 }
 
-function buildProdigiOrder(order, sessionId) {
-  const validated = validateOrder(
-    order,
-    sessionId
-  );
+async function getHostedImages(sessionId, items) {
+  const images = getStore(IMAGE_STORE);
+  const hostedURLs = new Map();
 
+  for (const item of items) {
+    const delivery = await images.get(
+      `delivery/${sessionId}/${item.id}`,
+      { type: "json" }
+    );
+
+    if (!delivery?.deliveryURL) {
+      throw new Error(
+        `Hosted image not prepared: ${item.id}`
+      );
+    }
+
+    const url = new URL(delivery.deliveryURL);
+    const expectedPrefix =
+      "/.netlify/functions/serve-image";
+
+    if (
+      url.origin !== SITE_URL ||
+      url.pathname !== expectedPrefix ||
+      url.searchParams.get("sessionId") !== sessionId ||
+      url.searchParams.get("imageId") !== item.id ||
+      !/^[a-f0-9]{64}$/.test(
+        url.searchParams.get("token") || ""
+      )
+    ) {
+      throw new Error(
+        `Invalid hosted image URL: ${item.id}`
+      );
+    }
+
+    // Check that our public delivery endpoint
+    // can actually return the JPEG.
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (
+      !response.ok ||
+      !(
+        response.headers.get("content-type") || ""
+      ).toLowerCase().startsWith("image/jpeg")
+    ) {
+      throw new Error(
+        `Hosted image unavailable: ${item.id} (HTTP ${response.status})`
+      );
+    }
+
+    const bytes = Buffer.from(
+      await response.arrayBuffer()
+    );
+
+    if (
+      bytes.length < 4 ||
+      bytes[0] !== 0xff ||
+      bytes[1] !== 0xd8 ||
+      bytes[2] !== 0xff
+    ) {
+      throw new Error(
+        `Hosted image is not JPEG: ${item.id}`
+      );
+    }
+
+    hostedURLs.set(item.id, url.toString());
+  }
+
+  return hostedURLs;
+}
+
+function buildProdigiOrder(
+  order,
+  sessionId,
+  validated,
+  hostedURLs
+) {
   const address = validated.address;
   const shipping = order.shipping;
 
@@ -142,7 +229,6 @@ function buildProdigiOrder(order, sessionId) {
     stateOrCounty: address.state
   };
 
-  // Prodigi rejects empty apartment/suite values.
   if (
     typeof address.line2 === "string" &&
     address.line2.trim()
@@ -174,7 +260,7 @@ function buildProdigiOrder(order, sessionId) {
     assets: [
       {
         printArea: "default",
-        url: item.url
+        url: hostedURLs.get(item.id)
       }
     ]
   }));
@@ -190,7 +276,6 @@ function buildProdigiOrder(order, sessionId) {
 }
 
 exports.handler = async function(event) {
-  // POST only: this function creates orders.
   if (event.httpMethod !== "POST") {
     return respond(405, {
       error: "Method not allowed"
@@ -232,7 +317,7 @@ exports.handler = async function(event) {
   try {
     connectLambda(event);
 
-    const store = getStore(STORE_NAME);
+    const store = getStore(ORDER_STORE);
     const orderKey = `order-${sessionId}`;
 
     const order = await store.get(orderKey, {
@@ -245,11 +330,14 @@ exports.handler = async function(event) {
       });
     }
 
-    // Do not resubmit orders already recorded
-    // as successfully fulfilled.
+    // Never resubmit an order that was already
+    // accepted by Prodigi.
     if (
-      order.fulfillment?.status === "submitted" &&
-      order.fulfillment?.prodigiOrderId
+      order.fulfillment?.prodigiOrderId &&
+      [
+        "submitted",
+        "needs_review"
+      ].includes(order.fulfillment?.status)
     ) {
       return respond(200, {
         success: true,
@@ -257,24 +345,36 @@ exports.handler = async function(event) {
         sessionId,
         prodigiOrderId:
           order.fulfillment.prodigiOrderId,
-        fulfillmentStatus: "submitted"
+        fulfillmentStatus:
+          order.fulfillment.status
       });
     }
 
-    const prodigiOrder = buildProdigiOrder(
+    const validated = validateOrder(
       order,
       sessionId
     );
 
+    // Hosted images are mandatory.
+    // Never fall back to original Snappic URLs.
+    const hostedURLs = await getHostedImages(
+      sessionId,
+      validated.items
+    );
+
+    const prodigiOrder = buildProdigiOrder(
+      order,
+      sessionId,
+      validated,
+      hostedURLs
+    );
+
     console.log(
-      "[Prodigi Fulfillment] Submitting:",
+      "[Prodigi Fulfillment] Submitting hosted images:",
       {
         sessionId,
-        itemCount: prodigiOrder.items.length,
-        totalPrints: prodigiOrder.items.reduce(
-          (sum, item) => sum + item.copies,
-          0
-        )
+        imageCount: hostedURLs.size,
+        totalPrints: validated.totalPrints
       }
     );
 
@@ -285,7 +385,8 @@ exports.handler = async function(event) {
         "Content-Type": "application/json",
         "Accept": "application/json"
       },
-      body: JSON.stringify(prodigiOrder)
+      body: JSON.stringify(prodigiOrder),
+      signal: AbortSignal.timeout(20000)
     });
 
     const rawResponse = await response.text();
@@ -307,11 +408,11 @@ exports.handler = async function(event) {
 
     const accepted =
       response.ok &&
-      (
-        outcome === "Created" ||
-        outcome === "AlreadyExists" ||
-        outcome === "CreatedWithIssues"
-      ) &&
+      [
+        "Created",
+        "AlreadyExists",
+        "CreatedWithIssues"
+      ].includes(outcome) &&
       !!prodigiOrderId;
 
     const now = new Date().toISOString();
@@ -372,10 +473,7 @@ exports.handler = async function(event) {
         outcome,
         prodigiOrderId,
         fulfillmentStatus: fulfillment.status,
-        totalPrints: prodigiOrder.items.reduce(
-          (sum, item) => sum + item.copies,
-          0
-        )
+        totalPrints: validated.totalPrints
       }
     );
 
@@ -387,7 +485,7 @@ exports.handler = async function(event) {
 
     return respond(500, {
       success: false,
-      error: "Prodigi fulfillment failed"
+      error: error.message
     });
   }
 };
