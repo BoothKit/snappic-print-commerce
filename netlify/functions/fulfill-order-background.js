@@ -27,13 +27,11 @@ function safeEqual(a, b) {
 }
 
 function getSiteURL() {
-  const configured = process.env.URL;
-
-  if (!configured) {
-    throw new Error("Netlify URL is not configured");
+  if (!process.env.URL) {
+    throw new Error("Netlify URL is missing");
   }
 
-  const url = new URL(configured);
+  const url = new URL(process.env.URL);
 
   if (
     url.protocol !== "https:" ||
@@ -49,10 +47,9 @@ function getSiteURL() {
   return url.origin;
 }
 
-async function prepareImages(sessionId) {
+async function callFunction(name, sessionId) {
   const url =
-    getSiteURL() +
-    "/.netlify/functions/prepare-images";
+    `${getSiteURL()}/.netlify/functions/${name}`;
 
   const response = await fetch(url, {
     method: "POST",
@@ -62,43 +59,51 @@ async function prepareImages(sessionId) {
         process.env.ORDER_INSPECT_TOKEN
     },
     body: JSON.stringify({ sessionId }),
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(90000)
   });
 
-  if (!response.ok) {
-    throw new Error(
-      `Image preparation failed: HTTP ${response.status}`
+  let result = {};
+
+  try {
+    result = await response.json();
+  } catch (_) {}
+
+  if (!response.ok || result.success !== true) {
+    const error = new Error(
+      `${name} failed with HTTP ${response.status}`
     );
+
+    error.statusCode = response.status;
+    error.fulfillmentStatus =
+      result.fulfillmentStatus || null;
+
+    throw error;
   }
 
-  const result = await response.json();
-
-  if (!result.success) {
-    throw new Error("Image preparation unsuccessful");
-  }
-
-  return result.imageCount;
+  return result;
 }
 
 exports.handler = async function(event) {
   if (event.httpMethod !== "POST") {
-    console.warn("Background worker: invalid method");
+    console.warn(
+      "[Fulfillment Worker] Invalid method"
+    );
     return;
   }
 
-  const suppliedToken =
+  const expected =
+    process.env.FULFILLMENT_WORKER_TOKEN;
+
+  const supplied =
     event.headers?.["x-fulfillment-token"] ||
     event.headers?.["X-Fulfillment-Token"];
 
-  const expectedToken =
-    process.env.FULFILLMENT_WORKER_TOKEN;
-
   if (
-    !expectedToken ||
-    !safeEqual(suppliedToken, expectedToken)
+    !expected ||
+    !safeEqual(supplied, expected)
   ) {
     console.warn(
-      "Background worker: unauthorized request"
+      "[Fulfillment Worker] Unauthorized"
     );
     return;
   }
@@ -112,14 +117,12 @@ exports.handler = async function(event) {
   let sessionId;
 
   try {
-    const payload = JSON.parse(
+    sessionId = JSON.parse(
       event.body || "{}"
-    );
-
-    sessionId = payload.sessionId;
+    ).sessionId;
   } catch (_) {
     console.error(
-      "Background worker: invalid JSON"
+      "[Fulfillment Worker] Invalid JSON"
     );
     return;
   }
@@ -128,17 +131,17 @@ exports.handler = async function(event) {
     typeof sessionId !== "string" ||
     !/^cs_test_[A-Za-z0-9]+$/.test(sessionId)
   ) {
-    console.warn(
-      "Background worker: invalid session ID"
+    console.error(
+      "[Fulfillment Worker] Invalid test session"
     );
     return;
   }
 
   connectLambda(event);
 
-  const orders = getStore(ORDER_STORE);
+  const store = getStore(ORDER_STORE);
 
-  const order = await orders.get(
+  const order = await store.get(
     `order-${sessionId}`,
     { type: "json" }
   );
@@ -149,51 +152,94 @@ exports.handler = async function(event) {
     order.sessionId !== sessionId ||
     order.paymentStatus !== "paid"
   ) {
-    console.warn(
-      "Background worker: paid order not found"
+    console.error(
+      "[Fulfillment Worker] Valid paid order not found",
+      { sessionId }
     );
     return;
   }
 
+  const fulfillment = order.fulfillment || {};
+
   if (
-    order.fulfillment?.status === "submitted" ||
-    order.fulfillment?.status === "needs_review" ||
-    order.fulfillment?.prodigiOrderId
+    fulfillment.prodigiOrderId ||
+    ["submitting", "needs_review"].includes(
+      fulfillment.status
+    )
   ) {
     console.log(
-      "Background worker: order already submitted"
+      "[Fulfillment Worker] Skipping existing submission",
+      {
+        sessionId,
+        status: fulfillment.status
+      }
     );
     return;
   }
 
   console.log(
-    "[Fulfillment Worker] Starting image preparation",
+    "[Fulfillment Worker] Preparing images",
     { sessionId }
   );
 
   try {
-    const imageCount =
-      await prepareImages(sessionId);
-
-    console.log(
-      "[Fulfillment Worker] Images prepared",
-      { sessionId, imageCount }
+    await callFunction(
+      "prepare-images",
+      sessionId
     );
 
-    // Prodigi submission is intentionally not
-    // enabled yet. We must add an atomic order
-    // claim and duplicate-submission protection
-    // before allowing unattended fulfillment.
-
+    console.log(
+      "[Fulfillment Worker] Images ready",
+      { sessionId }
+    );
   } catch (error) {
     console.error(
-      "[Fulfillment Worker] Preparation failed",
+      "[Fulfillment Worker] Image preparation failed",
       {
         sessionId,
         error: error.message
       }
     );
+    throw error;
+  }
 
+  console.log(
+    "[Fulfillment Worker] Submitting to Prodigi",
+    { sessionId }
+  );
+
+  try {
+    const result = await callFunction(
+      "fulfill-prodigi",
+      sessionId
+    );
+
+    console.log(
+      "[Fulfillment Worker] Prodigi result",
+      {
+        sessionId,
+        prodigiOrderId:
+          result.prodigiOrderId || null,
+        fulfillmentStatus:
+          result.fulfillmentStatus || null,
+        alreadySubmitted:
+          result.alreadySubmitted || false
+      }
+    );
+
+  } catch (error) {
+    console.error(
+      "[Fulfillment Worker] Prodigi submission needs attention",
+      {
+        sessionId,
+        error: error.message,
+        fulfillmentStatus:
+          error.fulfillmentStatus
+      }
+    );
+
+    // Do not automatically retry an uncertain
+    // Prodigi submission.
     throw error;
   }
 };
