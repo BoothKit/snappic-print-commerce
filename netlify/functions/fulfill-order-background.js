@@ -370,6 +370,34 @@ exports.handler = async function(event) {
     "authenticated"
   );
 
+  // TEMPORARY TEST:
+// Allow time for the paid order to become visible
+// before attempting to read Netlify Blobs.
+
+console.log(
+  "[Fulfillment Worker] Waiting before order lookup",
+  { sessionId, delaySeconds: 90 }
+);
+
+await recordCheckpoint(
+  sessionId,
+  "waiting_for_order_visibility",
+  { delaySeconds: 90 }
+);
+
+await new Promise(resolve =>
+  setTimeout(resolve, 90000)
+);
+
+console.log(
+  "[Fulfillment Worker] Visibility wait completed",
+  { sessionId }
+);
+
+await recordCheckpoint(
+  sessionId,
+  "visibility_wait_completed"
+);
   
   const orders = getStore(ORDER_STORE);
 
